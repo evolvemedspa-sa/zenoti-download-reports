@@ -1,0 +1,14 @@
+cookies.json
+browser_data/
+.env
+__pycache__/
+*.pyc
+debug_*.png
+error_*.png
+dashboard_load_error.png
+.venv/
+pw-browsers/
+config_googledrive.json
+config_googledrive1.json
+generate_token.py
+token.json

@@ -1,0 +1,5 @@
+pw-browsers/
+.env
+cookies.json
+__pycache__/
+*.pyc
