@@ -17,6 +17,7 @@ import sys
 import io
 import glob
 import csv
+import pandas as pd
 from datetime import date, datetime, timedelta
 from dateutil.relativedelta import relativedelta
 from dotenv import load_dotenv
@@ -46,6 +47,7 @@ date_from = first_day_this_month - relativedelta(months=1)
 
 START_DATE = date_from.strftime("%Y-%m-%d")
 END_DATE = date_to.strftime("%Y-%m-%d")
+BKP_START_DATE = date_to.replace(day=1).strftime("%Y-%m-%d")
 
 print("Date From:", date_from.strftime("%m/%d/%Y"))
 print("Date To  :", date_to.strftime("%m/%d/%Y"))
@@ -64,29 +66,49 @@ REPORT_FOLDERS = {
     "Memberships": "172HJzXYy_9_qtlgTSlZUgUJmZmT-7qwH",
     "Inventory Aging": "174ZiUaKjIjEKJNKe75mZXKAwya0F4GNK",
     "Stock Ledger": "1JwZGmMBu-3ZHb67edqOZ8vsj5u9eMRd9",
+    "FBAds": "1rs8hu18v64Xml3ZQ4F1Mr5uytZ6V5ppC",
+    "GoogleAds": "15Cxii7nKW4XXhJNPjAUd2Y819GxneYNa",
 }
 SCOPES = ["https://www.googleapis.com/auth/drive.file"]
+
+GSHEET_ID = "1ebRZa2y25O5wuPTdbIOeAqokc3FEawToSBVx5yUthfQ"
+GSHEET_TABS = {
+    "FBAds": {"gid": 1784599697, "folder_id": "1rs8hu18v64Xml3ZQ4F1Mr5uytZ6V5ppC"},
+    "GoogleAds": {"gid": 1126535667, "folder_id": "15Cxii7nKW4XXhJNPjAUd2Y819GxneYNa"},
+}
+
+
+_drive_service = None
+_drive_creds = None
 
 
 def get_drive_service():
     from google.auth.transport.requests import Request
 
-    token_json = os.getenv("GOOGLE_TOKEN_JSON")
-    if not token_json:
-        print("GOOGLE_TOKEN_JSON not set. Skipping upload.")
-        return None
+    global _drive_service, _drive_creds
 
-    creds_info = json.loads(token_json)
-    creds = Credentials.from_authorized_user_info(creds_info, SCOPES)
+    # Load creds once from env; keep them in-memory so a refreshed access token
+    # persists across calls (can't save back to env var on Railway).
+    if _drive_creds is None:
+        token_json = os.getenv("GOOGLE_TOKEN_JSON")
+        if not token_json:
+            print("GOOGLE_TOKEN_JSON not set. Skipping upload.")
+            return None
+        creds_info = json.loads(token_json)
+        _drive_creds = Credentials.from_authorized_user_info(creds_info, SCOPES)
 
-    # Refresh if expired
-    if creds.expired and creds.refresh_token:
+    # Refresh only when the live cached creds are actually expired (~once/hour),
+    # not on every report. Rebuild the service after a refresh.
+    if _drive_creds.expired and _drive_creds.refresh_token:
         print("Refreshing Google OAuth token...")
-        creds.refresh(Request())
-        # Note: can't save back to env var on Railway, but refresh_token stays valid
+        _drive_creds.refresh(Request())
+        _drive_service = None
         print("Token refreshed.")
 
-    return build("drive", "v3", credentials=creds)
+    if _drive_service is None:
+        _drive_service = build("drive", "v3", credentials=_drive_creds)
+
+    return _drive_service
 
 def upload_to_drive(filepath, folder_id=DRIVE_FOLDER_ID):
     service = get_drive_service()
@@ -105,7 +127,7 @@ def upload_to_drive(filepath, folder_id=DRIVE_FOLDER_ID):
         media_body=media,
         fields="id,webViewLink",
     ).execute()
-    time.sleep(5)
+    time.sleep(3)
 
     print(f"Uploaded to Drive: {filename} ({uploaded.get('webViewLink')})")
 
@@ -614,6 +636,69 @@ def apply_stock_ledger_filters(report_page):
     print("  Stock Ledger filters applied.")
 
 
+def download_gsheet_reports():
+    script_dir = os.path.dirname(__file__) or "."
+    succeeded = []
+    failed = []
+
+    for tab_name, info in GSHEET_TABS.items():
+        try:
+            url = f"https://docs.google.com/spreadsheets/d/{GSHEET_ID}/export?format=csv&gid={info['gid']}"
+            print(f"\nFetching Google Sheet: {tab_name} (gid={info['gid']})")
+            df = pd.read_csv(url)
+            print(f"  Rows: {len(df)}, Columns: {len(df.columns)}")
+
+            filename = os.path.join(script_dir, f"{tab_name}_{END_DATE}.csv")
+            df.to_csv(filename, index=False)
+
+            validate_csv(filename)
+            upload_to_drive(filename, info["folder_id"])
+            os.remove(filename)
+            succeeded.append(tab_name)
+        except Exception as e:
+            print(f"FAILED Google Sheet: {tab_name} — {e}")
+            failed.append((tab_name, str(e)))
+
+    return succeeded, failed
+
+
+def validate_report_folders(succeeded_reports):
+    service = get_drive_service()
+    if not service:
+        return []
+
+    missing = []
+    for report in succeeded_reports:
+        folder_id = REPORT_FOLDERS.get(report)
+        if not folder_id:
+            continue
+
+        if report == "Business KPI":
+            expected = f"business_kpi_{BKP_START_DATE}_to_{END_DATE}.csv"
+        else:
+            safe_name = report.replace(" ", "_").lower()
+            expected = f"{safe_name}_{START_DATE}_to_{END_DATE}.csv"
+
+        results = service.files().list(
+            q=f"'{folder_id}' in parents and trashed=false",
+            fields="files(id, name)",
+        ).execute()
+        files = results.get("files", [])
+        names = [f["name"] for f in files]
+
+        if expected in names:
+            print(f"  OK {report}: found '{expected}'")
+        else:
+            print(f"  MISSING {report}: expected '{expected}' — found: {names}")
+            missing.append(report)
+
+    if missing:
+        print(f"Missing reports in Drive: {missing}")
+    else:
+        print("All report folders validated successfully.")
+    return missing
+
+
 REPORT_FILTERS = {
     "Appointments": apply_appointments_filters,
     "Attendance": apply_attendance_filters,
@@ -630,38 +715,38 @@ REPORT_FILTERS = {
 def download_report(context, page, report_name, start_date, end_date):
     page.goto("https://evolvemedspa.zenoti.com/Admin/Reports/ReportsDashboard.aspx")
     page.wait_for_load_state("networkidle", timeout=120000)
-    time.sleep(5)
+    time.sleep(2)
     print(f"Opening report: {report_name}")
 
     if report_name == "Business KPI":
         page.evaluate('loadBookmarksViewAllGrid("Bookmarked")')
-        time.sleep(5)
+        time.sleep(2)
         with context.expect_page(timeout=120000) as new_page_info:
             page.evaluate("ReportsGrid_Row_Click(event,'business_kpi')")
     elif report_name == "Memberships":
         page.evaluate('loadBookmarksViewAllGrid("Bookmarked")')
-        time.sleep(5)
+        time.sleep(2)
         with context.expect_page(timeout=120000) as new_page_info:
             page.evaluate("ReportsGrid_Row_Click(event,'memberships')")
     elif report_name == "Inventory Aging":
         page.evaluate('loadBookmarksViewAllGrid("Bookmarked")')
-        time.sleep(5)
+        time.sleep(2)
         with context.expect_page(timeout=120000) as new_page_info:
             page.evaluate("ReportsGrid_Row_Click(event,'inventory_aging')")
     elif report_name == "Stock Ledger":
         page.evaluate('loadBookmarksViewAllGrid("Bookmarked")')
-        time.sleep(5)
+        time.sleep(2)
         with context.expect_page(timeout=120000) as new_page_info:
             page.evaluate("ReportsGrid_Row_Click(event,'stock_ledger')")
     else:
         with context.expect_page(timeout=120000) as new_page_info:
             page.locator('#gridReports span.report-name').get_by_text(report_name, exact=True).click(timeout=60000)
 
-    time.sleep(5)
+    time.sleep(2)
     report_page = new_page_info.value
     report_page.wait_for_load_state("load", timeout=120000)
     report_page.wait_for_load_state("networkidle", timeout=120000)
-    time.sleep(5)
+    time.sleep(2)
     print(f"{report_name} report page loaded.")
 
     if report_name == "Sales-Accrual":
@@ -685,7 +770,7 @@ def download_report(context, page, report_name, start_date, end_date):
             }}
         }})();
     """)
-    time.sleep(3)
+    time.sleep(2)
     print("Date range set.")
 
     filter_fn = REPORT_FILTERS.get(report_name)
@@ -695,9 +780,9 @@ def download_report(context, page, report_name, start_date, end_date):
 
     print("Refreshing report...")
     report_page.evaluate("document.querySelector('#btnRefresh').click()")
-    time.sleep(5)
+    time.sleep(2)
     report_page.wait_for_load_state("networkidle", timeout=300000)
-    time.sleep(5)
+    time.sleep(2)
 
     print("Exporting report to CSV...")
     report_page.locator('#dropdownMenuLink').click()
@@ -712,12 +797,12 @@ def download_report(context, page, report_name, start_date, end_date):
     download = download_info.value
     script_dir = os.path.dirname(__file__) or "."
     if report_name == "Business KPI":
-        filename = os.path.join(script_dir, f"Business_Kpi_{end_date}.csv")
+        filename = os.path.join(script_dir, f"business_kpi_{start_date}_to_{end_date}.csv")
     else:
         safe_name = report_name.replace(" ", "_").lower()
         filename = os.path.join(script_dir, f"{safe_name}_{start_date}_to_{end_date}.csv")
     download.save_as(filename)
-    time.sleep(5)
+    time.sleep(2)
 
     print(f"Validating downloaded file: {filename}")
     validate_csv(filename)
@@ -733,7 +818,7 @@ def download_report(context, page, report_name, start_date, end_date):
 print("Script starting...")
 sys.stdout.flush()
 
-LOG_FILENAME = os.path.join(os.path.dirname(__file__) or ".", f"logs_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}.txt")
+LOG_FILENAME = os.path.join(os.path.dirname(__file__) or ".", f"download_report_logs_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}.txt")
 log_file = open(LOG_FILENAME, "w", encoding="utf-8")
 
 
@@ -777,16 +862,17 @@ with sync_playwright() as p:
         print("Moving existing report files to Done...")
         move_existing_reports_to_done()
 
-        reports = ["Stock Ledger", "Appointments", "Sales-Cash", "Cost of Goods", "Attendance", "Business KPI", "Memberships"]
-        # reports = ["Stock Ledger", "Appointments"]
+        # reports = ["Stock Ledger", "Appointments", "Sales-Cash", "Cost of Goods", "Attendance", "Business KPI", "Memberships"]
+        reports = ["Business KPI"]
         failed_reports = []
         succeeded_reports = []
 
         for report in reports:
             try:
                 if report == "Business KPI":
-                    report_start = END_DATE
+                    report_start = BKP_START_DATE
                     report_end = END_DATE
+                    print(f"Business KPI date filter: {report_start} to {report_end}")
                 else:
                     report_start = START_DATE
                     report_end = END_DATE
@@ -796,7 +882,7 @@ with sync_playwright() as p:
                 os.remove(filename)
                 save_cookies(context)
                 succeeded_reports.append(report)
-                time.sleep(10)
+                time.sleep(5)
             except Exception as e:
                 print(f"FAILED: {report} — {e}")
                 failed_reports.append((report, str(e)))
@@ -807,7 +893,7 @@ with sync_playwright() as p:
                         except Exception:
                             pass
                 page.bring_to_front()
-                time.sleep(5)
+                time.sleep(2)
 
         if failed_reports:
             print(f"\n--- Retrying {len(failed_reports)} failed report(s) ---")
@@ -829,7 +915,7 @@ with sync_playwright() as p:
                 try:
                     print(f"Retrying: {report}")
                     if report == "Business KPI":
-                        report_start = END_DATE
+                        report_start = BKP_START_DATE
                         report_end = END_DATE
                     else:
                         report_start = START_DATE
@@ -840,7 +926,7 @@ with sync_playwright() as p:
                     os.remove(filename)
                     save_cookies(context)
                     succeeded_reports.append(report)
-                    time.sleep(10)
+                    time.sleep(5)
                 except Exception as e:
                     print(f"RETRY FAILED: {report} — {e}")
                     retry_still_failed.append((report, str(e)))
@@ -851,7 +937,7 @@ with sync_playwright() as p:
                             except Exception:
                                 pass
                     page.bring_to_front()
-                    time.sleep(5)
+                    time.sleep(2)
 
             failed_reports = retry_still_failed
 
@@ -860,8 +946,71 @@ with sync_playwright() as p:
         if failed_reports:
             print(f"Failed: {[r for r, _ in failed_reports]}")
 
+        print(f"\n--- Google Sheet Extraction ---")
+        gsheet_succeeded, gsheet_failed = download_gsheet_reports()
+        print(f"Google Sheets succeeded: {gsheet_succeeded}")
+        if gsheet_failed:
+            print(f"Google Sheets failed: {[r for r, _ in gsheet_failed]}")
+
         print("Checking report folders for duplicate filenames...")
         dedupe_report_folders()
+
+        print("Validating report folders contain recent downloads...")
+        missing_reports = validate_report_folders(succeeded_reports)
+
+        if missing_reports:
+            print(f"\n--- Re-checking {len(missing_reports)} missing report(s) before re-download ---")
+            time.sleep(10)
+            missing_reports = validate_report_folders(missing_reports)
+
+        if missing_reports:
+            print(f"\n--- Re-downloading {len(missing_reports)} missing report(s) ---")
+            try:
+                if needs_login(page):
+                    print("Re-logging in before re-download...")
+                    do_login(page)
+                    save_cookies(context)
+                    wait_for_dashboard(page)
+            except Exception as e:
+                print(f"Re-login failed, skipping re-download: {e}")
+                missing_reports = []
+
+            redownload_failed = []
+            for report in list(missing_reports):
+                try:
+                    print(f"Re-downloading: {report}")
+                    if report == "Business KPI":
+                        report_start = BKP_START_DATE
+                        report_end = END_DATE
+                    else:
+                        report_start = START_DATE
+                        report_end = END_DATE
+                    filename = download_report(context, page, report, report_start, report_end)
+                    folder_id = REPORT_FOLDERS.get(report, DRIVE_FOLDER_ID)
+                    upload_to_drive(filename, folder_id)
+                    os.remove(filename)
+                    save_cookies(context)
+                    time.sleep(2)
+                except Exception as e:
+                    print(f"RE-DOWNLOAD FAILED: {report} — {e}")
+                    redownload_failed.append(report)
+                    for p in context.pages:
+                        if p != page:
+                            try:
+                                p.close()
+                            except Exception:
+                                pass
+                    page.bring_to_front()
+                    time.sleep(2)
+
+            if redownload_failed:
+                print(f"Re-download failures: {redownload_failed}")
+
+            print("Final validation after re-download...")
+            dedupe_report_folders()
+            still_missing = validate_report_folders(succeeded_reports)
+            if still_missing:
+                raise Exception(f"Reports still missing after re-download: {still_missing}")
 
         print("Logging out...")
         page.goto("https://evolvemedspa.zenoti.com/Admin/Reports/ReportsDashboard.aspx")
@@ -870,7 +1019,7 @@ with sync_playwright() as p:
         page.locator('#usernameBtn').click
         time.sleep(1)
         page.locator('.userLogoutCls').click
-        time.sleep(5)
+        time.sleep(2)
         print("Logged out.")
 
         if failed_reports:

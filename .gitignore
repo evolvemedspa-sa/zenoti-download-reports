@@ -12,3 +12,6 @@ config_googledrive.json
 config_googledrive1.json
 generate_token.py
 token.json
+scripts/
+scripts/token_generator.py
+scripts/token.json
