@@ -862,8 +862,8 @@ with sync_playwright() as p:
         print("Moving existing report files to Done...")
         move_existing_reports_to_done()
 
-        # reports = ["Stock Ledger", "Appointments", "Sales-Cash", "Cost of Goods", "Attendance", "Business KPI", "Memberships"]
-        reports = ["Business KPI"]
+        reports = ["Stock Ledger", "Appointments", "Sales-Cash", "Cost of Goods", "Attendance", "Business KPI", "Memberships"]
+        # reports = ["Business KPI"]
         failed_reports = []
         succeeded_reports = []
 
