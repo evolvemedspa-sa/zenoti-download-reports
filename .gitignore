@@ -15,3 +15,4 @@ token.json
 scripts/
 scripts/token_generator.py
 scripts/token.json
+scripts/extract_token.py
