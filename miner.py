@@ -64,7 +64,7 @@ REPORT_FOLDERS = {
     "Sales-Accrual": "1TBdw_u-ADwb3m6GH-HY4WOVYblIPBxd-",
     "Business KPI": "1GjkgXcKrGFqa8l9iM-rW8u2MeRVCaB_M",
     "Memberships": "172HJzXYy_9_qtlgTSlZUgUJmZmT-7qwH",
-    "Inventory Aging": "174ZiUaKjIjEKJNKe75mZXKAwya0F4GNK",
+    "Current Stock": "174ZiUaKjIjEKJNKe75mZXKAwya0F4GNK",
     "Stock Ledger": "1JwZGmMBu-3ZHb67edqOZ8vsj5u9eMRd9",
     "FBAds": "1rs8hu18v64Xml3ZQ4F1Mr5uytZ6V5ppC",
     "GoogleAds": "15Cxii7nKW4XXhJNPjAUd2Y819GxneYNa",
@@ -577,11 +577,12 @@ def apply_memberships_filters(report_page):
     print("  Memberships filters applied.")
 
 
-def apply_inventory_aging_filters(report_page):
-    print("  Applying Inventory Aging filters...")
+def apply_current_stock_filters(report_page):
+    print("  Applying Current Stock filters...")
     report_page.evaluate("""
         (function() {
-            // All multi-selects → selectAll (Centers, Category, Sub Category, Vendor, Brand, Business Unit)
+            // All multi-selects → selectAll (Centers, Category, Sub Category,
+            // Vendor, Brand, Business Unit)
             $('select[multiple]').each(function() {
                 $(this).multiselect('selectAll', false);
             });
@@ -599,15 +600,11 @@ def apply_inventory_aging_filters(report_page):
                 else if (texts.indexOf('Greater than 0') !== -1 && texts.indexOf('Less than 0') !== -1) {
                     $(this).multiselect('select', '0');
                 }
-                // Stock Costing Method → Perpetual Average Cost (value "1")
-                else if (texts.some(function(t) { return t.indexOf('Perpetual') !== -1; })) {
-                    $(this).multiselect('select', '1');
-                }
             });
         })();
     """)
     time.sleep(2)
-    print("  Inventory Aging filters applied.")
+    print("  Current Stock filters applied.")
 
 
 def apply_stock_ledger_filters(report_page):
@@ -675,6 +672,8 @@ def validate_report_folders(succeeded_reports):
 
         if report == "Business KPI":
             expected = f"business_kpi_{BKP_START_DATE}_to_{END_DATE}.csv"
+        elif report == "Current Stock":
+            expected = f"current_stock_{END_DATE}.csv"
         else:
             safe_name = report.replace(" ", "_").lower()
             expected = f"{safe_name}_{START_DATE}_to_{END_DATE}.csv"
@@ -707,7 +706,7 @@ REPORT_FILTERS = {
     "Sales-Cash": apply_sales_cash_filters,
     "Business KPI": apply_business_kpi_filters,
     "Memberships": apply_memberships_filters,
-    "Inventory Aging": apply_inventory_aging_filters,
+    "Current Stock": apply_current_stock_filters,
     "Stock Ledger": apply_stock_ledger_filters,
 }
 
@@ -728,16 +727,16 @@ def download_report(context, page, report_name, start_date, end_date):
         time.sleep(2)
         with context.expect_page(timeout=120000) as new_page_info:
             page.evaluate("ReportsGrid_Row_Click(event,'memberships')")
-    elif report_name == "Inventory Aging":
-        page.evaluate('loadBookmarksViewAllGrid("Bookmarked")')
-        time.sleep(2)
-        with context.expect_page(timeout=120000) as new_page_info:
-            page.evaluate("ReportsGrid_Row_Click(event,'inventory_aging')")
     elif report_name == "Stock Ledger":
         page.evaluate('loadBookmarksViewAllGrid("Bookmarked")')
         time.sleep(2)
         with context.expect_page(timeout=120000) as new_page_info:
             page.evaluate("ReportsGrid_Row_Click(event,'stock_ledger')")
+    elif report_name == "Current Stock":
+        page.evaluate('loadBookmarksViewAllGrid("Bookmarked")')
+        time.sleep(2)
+        with context.expect_page(timeout=120000) as new_page_info:
+            page.evaluate("ReportsGrid_Row_Click(event,'current_stock')")
     else:
         with context.expect_page(timeout=120000) as new_page_info:
             page.locator('#gridReports span.report-name').get_by_text(report_name, exact=True).click(timeout=60000)
@@ -752,6 +751,11 @@ def download_report(context, page, report_name, start_date, end_date):
     if report_name == "Sales-Accrual":
         start_dt = f"{start_date} 00:00"
         end_dt = f"{end_date} 23:59"
+        dt_format = "YYYY-MM-DD HH:mm"
+    elif report_name == "Current Stock":
+        # Single "Stock as on" datetime = T-1 at 07:00 AM
+        start_dt = f"{start_date} 07:00"
+        end_dt = f"{start_date} 07:00"
         dt_format = "YYYY-MM-DD HH:mm"
     else:
         start_dt = start_date
@@ -779,7 +783,19 @@ def download_report(context, page, report_name, start_date, end_date):
     time.sleep(2)
 
     print("Refreshing report...")
-    report_page.evaluate("document.querySelector('#btnRefresh').click()")
+    if report_name == "Current Stock":
+        report_page.evaluate("""
+            (function() {
+                if (typeof btnCurrentStock_onClick === 'function') {
+                    btnCurrentStock_onClick();
+                } else {
+                    var b = document.querySelector('#btnRefresh');
+                    if (b) b.click();
+                }
+            })();
+        """)
+    else:
+        report_page.evaluate("document.querySelector('#btnRefresh').click()")
     time.sleep(2)
     report_page.wait_for_load_state("networkidle", timeout=300000)
     time.sleep(2)
@@ -798,6 +814,8 @@ def download_report(context, page, report_name, start_date, end_date):
     script_dir = os.path.dirname(__file__) or "."
     if report_name == "Business KPI":
         filename = os.path.join(script_dir, f"business_kpi_{start_date}_to_{end_date}.csv")
+    elif report_name == "Current Stock":
+        filename = os.path.join(script_dir, f"current_stock_{end_date}.csv")
     else:
         safe_name = report_name.replace(" ", "_").lower()
         filename = os.path.join(script_dir, f"{safe_name}_{start_date}_to_{end_date}.csv")
@@ -862,8 +880,8 @@ with sync_playwright() as p:
         print("Moving existing report files to Done...")
         move_existing_reports_to_done()
 
-        reports = ["Stock Ledger", "Appointments", "Sales-Cash", "Cost of Goods", "Attendance", "Business KPI", "Memberships"]
-        # reports = ["Business KPI"]
+        reports = ["Stock Ledger", "Appointments", "Sales-Cash", "Cost of Goods", "Attendance", "Business KPI", "Memberships", "Current Stock"]
+        # reports = ["Current Stock"]
         failed_reports = []
         succeeded_reports = []
 
@@ -873,6 +891,9 @@ with sync_playwright() as p:
                     report_start = BKP_START_DATE
                     report_end = END_DATE
                     print(f"Business KPI date filter: {report_start} to {report_end}")
+                elif report == "Current Stock":
+                    report_start = END_DATE
+                    report_end = END_DATE
                 else:
                     report_start = START_DATE
                     report_end = END_DATE
@@ -916,6 +937,9 @@ with sync_playwright() as p:
                     print(f"Retrying: {report}")
                     if report == "Business KPI":
                         report_start = BKP_START_DATE
+                        report_end = END_DATE
+                    elif report == "Current Stock":
+                        report_start = END_DATE
                         report_end = END_DATE
                     else:
                         report_start = START_DATE
@@ -981,6 +1005,9 @@ with sync_playwright() as p:
                     print(f"Re-downloading: {report}")
                     if report == "Business KPI":
                         report_start = BKP_START_DATE
+                        report_end = END_DATE
+                    elif report == "Current Stock":
+                        report_start = END_DATE
                         report_end = END_DATE
                     else:
                         report_start = START_DATE
