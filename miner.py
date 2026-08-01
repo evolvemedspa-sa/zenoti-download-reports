@@ -50,8 +50,12 @@ if not USERNAME or not PASSWORD:
 
 today = date.today()
 date_to = today - timedelta(days=1)
-first_day_this_month = today.replace(day=1)
-date_from = first_day_this_month - relativedelta(months=1)
+# Anchor the window on date_to, not today: on the 1st of a month date_to has
+# already rolled back into the previous month, so anchoring on today would
+# shift the whole range forward by one month (Aug 1 -> Jul 1..Jul 31 instead
+# of Jun 1..Jul 31).
+first_day_of_period = date_to.replace(day=1)
+date_from = first_day_of_period - relativedelta(months=1)
 
 START_DATE = date_from.strftime("%Y-%m-%d")
 END_DATE = date_to.strftime("%Y-%m-%d")
