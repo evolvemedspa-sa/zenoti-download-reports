@@ -32,6 +32,14 @@ PASSWORD = os.getenv("MINER_PASSWORD")
 ADMIN_URL = "https://evolvemedspa.zenoti.com/Admin/Admin.aspx"
 COOKIES_FILE = os.path.join(os.path.dirname(__file__), "cookies.json")
 TOKEN_FILE = os.path.join(os.path.dirname(__file__), "token.json")
+LOGIN_MAX_ATTEMPTS = 3
+LOGIN_RETRY_BACKOFF = 5
+REDOWNLOAD_MAX_ATTEMPTS = 2
+REDOWNLOAD_RETRY_BACKOFF = 10
+
+# Current Stock exports as CSV. Flip to True to download it as a workbook
+# (#export_excel_v2) instead; the Excel path and validate_excel() stay in place.
+CURRENT_STOCK_AS_EXCEL = False
 
 if not USERNAME or not PASSWORD:
     raise ValueError("MINER_USER and MINER_PASSWORD must be set in the .env file.")
@@ -121,7 +129,16 @@ def upload_to_drive(filepath, folder_id=DRIVE_FOLDER_ID):
     # move_existing_reports_to_done() before any download, so no pre-move here.
     print(f"Uploading new file: {filename}")
     file_metadata = {"name": filename, "parents": [folder_id]}
-    media = MediaFileUpload(filepath, mimetype="text/csv", resumable=True)
+    # Pick the mimetype from the extension: Current Stock uploads a workbook, so a
+    # hardcoded text/csv would make Drive mislabel (and fail to preview) it.
+    mimetypes_by_ext = {
+        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ".xls": "application/vnd.ms-excel",
+        ".csv": "text/csv",
+    }
+    ext = os.path.splitext(filename)[1].lower()
+    mimetype = mimetypes_by_ext.get(ext, "application/octet-stream")
+    media = MediaFileUpload(filepath, mimetype=mimetype, resumable=True)
     uploaded = service.files().create(
         body=file_metadata,
         media_body=media,
@@ -163,26 +180,83 @@ def upload_to_drive(filepath, folder_id=DRIVE_FOLDER_ID):
     return uploaded
 
 
-def move_existing_reports_to_done():
-    service = get_drive_service()
-    if not service:
-        return
+def list_all_files(service, folder_id):
+    """Every file in a folder, following pagination.
 
-    for folder_name, folder_id in REPORT_FOLDERS.items():
-        results = service.files().list(
+    files().list() returns at most pageSize results (Drive v3 defaults to 100),
+    so a single call silently misses anything past the first page. Ask for the
+    max and follow nextPageToken so callers really do see all files.
+
+    Caveat: under the drive.file scope this only ever returns files created by
+    THIS OAuth client. A file uploaded by hand, or by a run using a different
+    client_id, is invisible here and therefore unmovable."""
+    files = []
+    page_token = None
+    while True:
+        response = service.files().list(
             q=f"'{folder_id}' in parents and trashed=false",
-            fields="files(id, name)",
+            fields="nextPageToken, files(id, name)",
+            pageSize=1000,
+            pageToken=page_token,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
         ).execute()
-        existing = results.get("files", [])
+        files.extend(response.get("files", []))
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            return files
+
+
+def move_existing_reports_to_done():
+    for folder_name, folder_id in REPORT_FOLDERS.items():
+        service = get_drive_service()
+        if not service:
+            return
+
+        existing = list_all_files(service, folder_id)
+        if not existing:
+            continue
+
+        print(f"{folder_name}: {len(existing)} existing file(s) to move")
+        moved = 0
         for old_file in existing:
             print(f"Moving {folder_name}/{old_file['name']} to Done folder")
-            service.files().update(
-                fileId=old_file["id"],
-                addParents=DONE_FOLDER_ID,
-                removeParents=folder_id,
-                fields="id",
-            ).execute()
-            time.sleep(2)
+            # Isolate per file: one un-movable file (permissions, a concurrent
+            # delete) shouldn't abandon the rest of this folder or the folders
+            # after it. This sweep runs pre-login, so raising here would kill
+            # the whole run before a single report is downloaded.
+            try:
+                service.files().update(
+                    fileId=old_file["id"],
+                    addParents=DONE_FOLDER_ID,
+                    removeParents=folder_id,
+                    fields="id, parents",
+                    supportsAllDrives=True,
+                ).execute()
+                moved += 1
+                time.sleep(2)
+            except Exception as e:
+                print(f"  Could not move {folder_name}/{old_file['name']}: {e}")
+
+        if moved != len(existing):
+            print(f"  {folder_name}: moved {moved}/{len(existing)}, {len(existing) - moved} left behind")
+
+        # Verify rather than trust the update() response: re-list the folder and
+        # report anything still visible. A file that survives here was either
+        # re-parented back, or update() reported success without taking effect.
+        try:
+            remaining = list_all_files(service, folder_id)
+        except Exception as e:
+            print(f"  {folder_name}: could not verify sweep: {e}")
+            continue
+
+        if remaining:
+            print(
+                f"  WARNING {folder_name}: {len(remaining)} file(s) STILL in the folder "
+                f"after the sweep: {[f['name'] for f in remaining]}"
+            )
+        else:
+            print(f"  {folder_name}: verified empty.")
 
 
 def dedupe_report_folders():
@@ -195,11 +269,7 @@ def dedupe_report_folders():
         return
 
     for folder_name, folder_id in REPORT_FOLDERS.items():
-        results = service.files().list(
-            q=f"'{folder_id}' in parents and trashed=false",
-            fields="files(id, name)",
-        ).execute()
-        files = results.get("files", [])
+        files = list_all_files(service, folder_id)
 
         by_name = {}
         for f in files:
@@ -265,12 +335,73 @@ def validate_csv(filepath):
     return True
 
 
+def validate_excel(filepath):
+    """Sanity-check a downloaded workbook.
+
+    Zenoti sometimes serves an HTML error page with a spreadsheet filename, so
+    check the magic bytes: .xlsx is a zip ("PK"), legacy .xls is OLE2. Row/column
+    counts are only checked when openpyxl is installed.
+    """
+    filename = os.path.basename(filepath)
+
+    if not os.path.exists(filepath):
+        raise Exception(f"File not found: {filename}")
+
+    filesize = os.path.getsize(filepath)
+    if filesize == 0:
+        raise Exception(f"File is empty: {filename}")
+
+    print(f"  File size: {filesize / (1024 * 1024):.2f} MB")
+
+    with open(filepath, "rb") as f:
+        magic = f.read(8)
+
+    if magic[:2] == b"PK":
+        kind = "xlsx"
+    elif magic == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":
+        kind = "xls"
+    else:
+        head = magic.decode("utf-8", errors="replace").lower()
+        if "<html" in head or "<!doc" in head or magic.lstrip()[:1] == b"<":
+            raise Exception(f"File is HTML, not a workbook (possible error page): {filename}")
+        raise Exception(f"File is not a valid Excel workbook: {filename}")
+
+    if kind == "xls":
+        # Legacy format; openpyxl cannot read it. Magic bytes are as far as we go.
+        print(f"  Workbook valid: legacy .xls, {filesize} bytes")
+        return True
+
+    try:
+        from openpyxl import load_workbook
+    except ImportError:
+        print("  Workbook valid: xlsx container OK (install openpyxl for row checks)")
+        return True
+
+    wb = load_workbook(filepath, read_only=True)
+    try:
+        ws = wb.active
+        rows = ws.max_row or 0
+        cols = ws.max_column or 0
+        if cols < 2:
+            raise Exception(f"Workbook has only {cols} column(s), likely corrupt: {filename}")
+        if rows < 2:
+            raise Exception(f"Workbook has headers but no data rows: {filename}")
+    finally:
+        wb.close()
+
+    print(f"  Workbook valid: {cols} columns, {rows} rows")
+    return True
+
+
 def cleanup_old_csvs():
     script_dir = os.path.dirname(__file__) or "."
-    for f in glob.glob(os.path.join(script_dir, "*.csv")):
-        if date_to.strftime("%Y-%m-%d") not in os.path.basename(f):
-            os.remove(f)
-            print(f"Cleaned up old CSV: {f}")
+    # Current Stock now downloads as a workbook, so sweep those too — otherwise
+    # a stale current_stock_*.xlsx sits in the repo root forever.
+    for pattern in ("*.csv", "*.xlsx", "*.xls"):
+        for f in glob.glob(os.path.join(script_dir, pattern)):
+            if date_to.strftime("%Y-%m-%d") not in os.path.basename(f):
+                os.remove(f)
+                print(f"Cleaned up old report: {f}")
 
 
 def create_browser_and_context(pw):
@@ -311,7 +442,7 @@ def save_cookies(context):
 
 
 def needs_login(page):
-    print(f"Checking if login is needed. Current URL: {page.url}")
+    # print(f"Checking if login is needed. Current URL: {page.url}")
     page.goto(ADMIN_URL, wait_until="domcontentloaded")
     try:
         page.wait_for_url("**/Admin/**", timeout=10000)
@@ -320,7 +451,7 @@ def needs_login(page):
         return True
 
 
-def do_login(page):
+def _login_attempt(page):
     print(f"Current URL before login: {page.url}")
 
     username_sel = "input#Username, input[name='Username'], input[name='username'], input[type='email']"
@@ -338,11 +469,13 @@ def do_login(page):
     print(f"Login page loaded. URL: {page.url}")
 
     page.locator(username_sel).first.click()
+    page.locator(username_sel).first.fill("")
     page.locator(username_sel).first.press_sequentially(USERNAME, delay=50)
     time.sleep(random.uniform(0.5, 1.5))
     print("Username entered.")
 
     page.locator('#Password').click()
+    page.locator('#Password').fill("")
     page.locator('#Password').press_sequentially(PASSWORD, delay=50)
     time.sleep(random.uniform(0.5, 1.5))
     print("Password entered.")
@@ -361,6 +494,49 @@ def do_login(page):
 
     page.wait_for_url("**/Admin/**", timeout=30000)
     print("Login successful!")
+
+
+def do_login(page):
+    """Log in, retrying up to LOGIN_MAX_ATTEMPTS times.
+
+    Login is a single point of failure for the whole run: all three call sites
+    abandon their remaining work if it raises. Transient causes (slow login
+    form, captcha interstitial, a dropped nav) usually clear on a second try."""
+    last_error = None
+
+    for attempt in range(1, LOGIN_MAX_ATTEMPTS + 1):
+        print(f"Login attempt {attempt}/{LOGIN_MAX_ATTEMPTS}...")
+        try:
+            _login_attempt(page)
+            return
+        except Exception as e:
+            last_error = e
+            print(f"Login attempt {attempt}/{LOGIN_MAX_ATTEMPTS} failed: {e}")
+
+        if attempt == LOGIN_MAX_ATTEMPTS:
+            break
+
+        backoff = LOGIN_RETRY_BACKOFF * attempt
+        print(f"Retrying login in {backoff}s...")
+        time.sleep(backoff)
+
+        # Reload the login page so the next attempt starts from a clean form
+        # rather than whatever half-submitted state the failure left behind.
+        try:
+            page.goto(ADMIN_URL, wait_until="networkidle", timeout=60000)
+        except Exception as nav_err:
+            print(f"  Could not reload login page: {nav_err}")
+            continue
+
+        # The submit may have actually gone through and only the post-login
+        # wait timed out — same check needs_login() uses.
+        if "/Admin/" in page.url:
+            print("Already authenticated after reload. Login complete.")
+            return
+
+    raise Exception(
+        f"Login failed after {LOGIN_MAX_ATTEMPTS} attempts: {last_error}"
+    ) from last_error
 
 
 def wait_for_dashboard(page):
@@ -671,24 +847,35 @@ def validate_report_folders(succeeded_reports):
             continue
 
         if report == "Business KPI":
-            expected = f"business_kpi_{BKP_START_DATE}_to_{END_DATE}.csv"
+            expected = [f"business_kpi_{BKP_START_DATE}_to_{END_DATE}.csv"]
         elif report == "Current Stock":
-            expected = f"current_stock_{END_DATE}.csv"
+            if CURRENT_STOCK_AS_EXCEL:
+                # Extension follows whatever the server served, so accept both.
+                expected = [
+                    f"current_stock_{END_DATE}.xlsx",
+                    f"current_stock_{END_DATE}.xls",
+                ]
+            else:
+                expected = [f"current_stock_{END_DATE}.csv"]
         else:
             safe_name = report.replace(" ", "_").lower()
-            expected = f"{safe_name}_{START_DATE}_to_{END_DATE}.csv"
+            expected = [f"{safe_name}_{START_DATE}_to_{END_DATE}.csv"]
 
         results = service.files().list(
             q=f"'{folder_id}' in parents and trashed=false",
             fields="files(id, name)",
+            pageSize=1000,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
         ).execute()
         files = results.get("files", [])
         names = [f["name"] for f in files]
 
-        if expected in names:
-            print(f"  OK {report}: found '{expected}'")
+        found = next((e for e in expected if e in names), None)
+        if found:
+            print(f"  OK {report}: found '{found}'")
         else:
-            print(f"  MISSING {report}: expected '{expected}' — found: {names}")
+            print(f"  MISSING {report}: expected '{' or '.join(expected)}' — found: {names}")
             missing.append(report)
 
     if missing:
@@ -800,14 +987,20 @@ def download_report(context, page, report_name, start_date, end_date):
     report_page.wait_for_load_state("networkidle", timeout=300000)
     time.sleep(2)
 
-    print("Exporting report to CSV...")
+    # The dropdown offers CSV (#export_csv), Excel (#export_excel_v2) and a hidden
+    # "Excel with subtotals"; #export_excel_v2 runs Export_Click(true, "excel_v2").
+    # Current Stock's Excel export is gated behind CURRENT_STOCK_AS_EXCEL.
+    is_excel = report_name == "Current Stock" and CURRENT_STOCK_AS_EXCEL
+    export_sel = "#export_excel_v2" if is_excel else "#export_csv"
+
+    print(f"Exporting report to {'Excel' if is_excel else 'CSV'}...")
     report_page.locator('#dropdownMenuLink').click()
     time.sleep(2)
-    report_page.wait_for_selector('#export_csv', state='attached', timeout=30000)
+    report_page.wait_for_selector(export_sel, state='attached', timeout=30000)
 
     download_timeout = 900000 if report_name == "Stock Ledger" else 300000
     with report_page.expect_download(timeout=download_timeout) as download_info:
-        report_page.evaluate("document.querySelector('#export_csv').click()")
+        report_page.evaluate(f"document.querySelector('{export_sel}').click()")
 
     time.sleep(10)
     download = download_info.value
@@ -815,7 +1008,16 @@ def download_report(context, page, report_name, start_date, end_date):
     if report_name == "Business KPI":
         filename = os.path.join(script_dir, f"business_kpi_{start_date}_to_{end_date}.csv")
     elif report_name == "Current Stock":
-        filename = os.path.join(script_dir, f"current_stock_{end_date}.csv")
+        if is_excel:
+            # Trust the server's extension when it gives one (.xlsx vs .xls);
+            # validate_report_folders() accepts either.
+            suggested = download.suggested_filename or ""
+            ext = os.path.splitext(suggested)[1].lower()
+            if ext not in (".xlsx", ".xls"):
+                ext = ".xlsx"
+        else:
+            ext = ".csv"
+        filename = os.path.join(script_dir, f"current_stock_{end_date}{ext}")
     else:
         safe_name = report_name.replace(" ", "_").lower()
         filename = os.path.join(script_dir, f"{safe_name}_{start_date}_to_{end_date}.csv")
@@ -823,7 +1025,10 @@ def download_report(context, page, report_name, start_date, end_date):
     time.sleep(2)
 
     print(f"Validating downloaded file: {filename}")
-    validate_csv(filename)
+    if is_excel:
+        validate_excel(filename)
+    else:
+        validate_csv(filename)
     print(f"Downloaded: {filename}")
 
     report_page.close()
@@ -858,6 +1063,13 @@ sys.stdout = Tee(sys.__stdout__, log_file)
 
 cleanup_old_csvs()
 
+# Phase 1: scan every report folder upfront and move any existing file
+# (1 or more) to Done before downloading anything. Runs before the browser
+# launches so leftovers from a previous run are cleared even if login fails,
+# and so a bad GOOGLE_TOKEN_JSON surfaces before a full login.
+print("Moving existing report files to Done...")
+move_existing_reports_to_done()
+
 with sync_playwright() as p:
     print("Playwright started.")
     browser, context = create_browser_and_context(p)
@@ -874,11 +1086,6 @@ with sync_playwright() as p:
 
         wait_for_dashboard(page)
         save_cookies(context)
-
-        # Phase 1: scan every report folder upfront and move any existing file
-        # (1 or more) to Done before downloading anything.
-        print("Moving existing report files to Done...")
-        move_existing_reports_to_done()
 
         reports = ["Stock Ledger", "Appointments", "Sales-Cash", "Cost of Goods", "Attendance", "Business KPI", "Memberships", "Current Stock"]
         # reports = ["Current Stock"]
@@ -987,8 +1194,20 @@ with sync_playwright() as p:
             time.sleep(10)
             missing_reports = validate_report_folders(missing_reports)
 
-        if missing_reports:
-            print(f"\n--- Re-downloading {len(missing_reports)} missing report(s) ---")
+        # Re-download anything Drive says is absent, then dedupe + re-validate and
+        # try again. Bounded at REDOWNLOAD_MAX_ATTEMPTS: a report that fails twice
+        # is failing for a reason a third pass won't fix, and each pass costs a
+        # full download.
+        redownload_failed = []
+        attempted_redownload = bool(missing_reports)
+        for attempt in range(1, REDOWNLOAD_MAX_ATTEMPTS + 1):
+            if not missing_reports:
+                break
+
+            print(
+                f"\n--- Re-downloading {len(missing_reports)} missing report(s) "
+                f"(attempt {attempt}/{REDOWNLOAD_MAX_ATTEMPTS}) ---"
+            )
             try:
                 if needs_login(page):
                     print("Re-logging in before re-download...")
@@ -996,8 +1215,8 @@ with sync_playwright() as p:
                     save_cookies(context)
                     wait_for_dashboard(page)
             except Exception as e:
-                print(f"Re-login failed, skipping re-download: {e}")
-                missing_reports = []
+                print(f"Re-login failed, abandoning re-download: {e}")
+                break
 
             redownload_failed = []
             for report in list(missing_reports):
@@ -1033,11 +1252,30 @@ with sync_playwright() as p:
             if redownload_failed:
                 print(f"Re-download failures: {redownload_failed}")
 
-            print("Final validation after re-download...")
+            # Validate against the reports we just re-downloaded, not the full
+            # succeeded list, so the next pass retries only what is still absent.
+            print(f"Validating after re-download attempt {attempt}...")
+            dedupe_report_folders()
+            missing_reports = validate_report_folders(missing_reports)
+
+            if missing_reports and attempt < REDOWNLOAD_MAX_ATTEMPTS:
+                print(f"Still missing {missing_reports}; retrying in {REDOWNLOAD_RETRY_BACKOFF}s...")
+                time.sleep(REDOWNLOAD_RETRY_BACKOFF)
+
+        # Final sweep across every report that downloaded successfully, so one that
+        # vanished from Drive after its own pass is still caught. Skipped when the
+        # first validation was already clean — line above would just repeat it.
+        if attempted_redownload:
+            print("Final validation...")
             dedupe_report_folders()
             still_missing = validate_report_folders(succeeded_reports)
-            if still_missing:
-                raise Exception(f"Reports still missing after re-download: {still_missing}")
+        else:
+            still_missing = missing_reports
+
+        if still_missing:
+            raise Exception(
+                f"Reports still missing after {REDOWNLOAD_MAX_ATTEMPTS} re-download attempt(s): {still_missing}"
+            )
 
         print("Logging out...")
         page.goto("https://evolvemedspa.zenoti.com/Admin/Reports/ReportsDashboard.aspx")
