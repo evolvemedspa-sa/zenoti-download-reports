@@ -74,6 +74,7 @@ REPORT_FOLDERS = {
     "Sales-Cash": "1FXYnXXQiwQxVAu8IBQOm5GROddoBOXwp",
     "Appointments": "12jqbWWMgpgioR_23KJKLXSvDignwrcP2",
     "Sales-Accrual": "1TBdw_u-ADwb3m6GH-HY4WOVYblIPBxd-",
+    "Employee Sales": "123hD_j54WtSPIAjdACWFEGaO877lztRs",
     "Business KPI": "1GjkgXcKrGFqa8l9iM-rW8u2MeRVCaB_M",
     "Memberships": "172HJzXYy_9_qtlgTSlZUgUJmZmT-7qwH",
     "Current Stock": "174ZiUaKjIjEKJNKe75mZXKAwya0F4GNK",
@@ -665,6 +666,46 @@ def apply_sales_accrual_filters(report_page):
     print("  Sales-Accrual filters applied.")
 
 
+def apply_employee_sales_filters(report_page):
+    print("  Applying Employee Sales filters...")
+    # Targeted per-id selection, NOT a blanket $('select[multiple]') sweep:
+    # the Employee filter is also a multiselect and must stay empty.
+    report_page.evaluate("""
+        (function() {
+            ['elm_allowed_centers', 'elm_payment_type', 'elm_sale_type', 'elm_invoice_status'].forEach(function(id) {
+                var $sel = $('#' + id);
+                if ($sel.length) {
+                    $sel.multiselect('selectAll', false);
+                    $sel.multiselect('updateButtonText');
+                }
+            });
+
+            // Item Type → Service + Product only
+            var $itemType = $('#elm_item_type');
+            if ($itemType.length) {
+                $itemType.multiselect('deselectAll', false);
+                $itemType.multiselect('select', ['Service', 'Product']);
+                $itemType.multiselect('updateButtonText');
+            }
+        })();
+    """)
+    time.sleep(2)
+
+    selected = report_page.evaluate("""
+        (function() {
+            var out = {};
+            ['elm_allowed_centers', 'elm_item_type', 'elm_payment_type', 'elm_sale_type', 'elm_invoice_status'].forEach(function(id) {
+                var el = document.getElementById(id);
+                out[id] = el ? Array.from(el.options).filter(function(o){return o.selected}).length : null;
+            });
+            return out;
+        })();
+    """)
+    print(f"  Selected counts: {selected}")
+    print("  Employee filter left empty.")
+    print("  Employee Sales filters applied.")
+
+
 def apply_sales_cash_filters(report_page):
     print("  Applying Sales-Cash filters...")
     report_page.evaluate("""
@@ -894,6 +935,7 @@ REPORT_FILTERS = {
     "Attendance": apply_attendance_filters,
     "Cost of Goods": apply_cost_of_goods_filters,
     "Sales-Accrual": apply_sales_accrual_filters,
+    "Employee Sales": apply_employee_sales_filters,
     "Sales-Cash": apply_sales_cash_filters,
     "Business KPI": apply_business_kpi_filters,
     "Memberships": apply_memberships_filters,
@@ -928,6 +970,44 @@ def download_report(context, page, report_name, start_date, end_date):
         time.sleep(2)
         with context.expect_page(timeout=120000) as new_page_info:
             page.evaluate("ReportsGrid_Row_Click(event,'current_stock')")
+    elif report_name == "Employee Sales":
+        # Unlike the other bookmarked reports there is no
+        # ReportsGrid_Row_Click(event,'<id>') handle for this one, so find the
+        # row by its visible name. "View All" renders the grid inside the
+        # #dialog-reports modal and the same span may also exist in the grid
+        # *behind* it, so scope the lookup to the modal — and dispatch the click
+        # from JS, because a Playwright click is eaten by the modal overlay
+        # intercepting pointer events.
+        page.evaluate('loadBookmarksViewAllGrid("Bookmarked")')
+        time.sleep(3)
+
+        find_row_js = """
+            (function() {
+                var modal = document.querySelector('#dialog-reports.show') ||
+                            document.querySelector('#dialog-reports');
+                var scope = modal || document;
+                return Array.from(scope.querySelectorAll('span.report-name'))
+                    .find(function(s) { return s.textContent.trim() === 'Employee Sales'; }) || null;
+            })()
+        """.strip()
+
+        # Fail fast on a missing row instead of burning the 120s expect_page timeout.
+        if not page.evaluate(f"!!{find_row_js}"):
+            raise Exception("'Employee Sales' not found in the View All report grid")
+
+        click_row_js = f"""
+            (function() {{
+                var span = {find_row_js};
+                var row = span.closest('tr') || span.closest('td') || span;
+                var handler = row.getAttribute('onclick') ||
+                              (row.parentElement && row.parentElement.getAttribute('onclick')) || '';
+                row.click();
+                return handler || '(no onclick attribute; dispatched click)';
+            }})();
+        """
+
+        with context.expect_page(timeout=120000) as new_page_info:
+            print(f"  Row handler: {page.evaluate(click_row_js)}")
     else:
         with context.expect_page(timeout=120000) as new_page_info:
             page.locator('#gridReports span.report-name').get_by_text(report_name, exact=True).click(timeout=60000)
@@ -985,6 +1065,18 @@ def download_report(context, page, report_name, start_date, end_date):
                 }
             })();
         """)
+    elif report_name == "Employee Sales":
+        # #btnRefresh renders disabled until the page decides the filter set is
+        # complete; drop the attribute so the click registers.
+        report_page.evaluate("""
+            (function() {
+                var b = document.querySelector('#btnRefresh');
+                if (b) {
+                    b.removeAttribute('disabled');
+                    b.click();
+                }
+            })();
+        """)
     else:
         report_page.evaluate("document.querySelector('#btnRefresh').click()")
     time.sleep(2)
@@ -1002,7 +1094,7 @@ def download_report(context, page, report_name, start_date, end_date):
     time.sleep(2)
     report_page.wait_for_selector(export_sel, state='attached', timeout=30000)
 
-    download_timeout = 900000 if report_name == "Stock Ledger" else 300000
+    download_timeout = 900000 if report_name == "Stock Ledger" else 600000 if report_name == "Employee Sales" else 300000
     with report_page.expect_download(timeout=download_timeout) as download_info:
         report_page.evaluate(f"document.querySelector('{export_sel}').click()")
 
@@ -1091,8 +1183,8 @@ with sync_playwright() as p:
         wait_for_dashboard(page)
         save_cookies(context)
 
-        reports = ["Stock Ledger", "Appointments", "Sales-Cash", "Cost of Goods", "Attendance", "Business KPI", "Memberships", "Current Stock"]
-        # reports = ["Current Stock"]
+        # reports = ["Stock Ledger", "Appointments", "Sales-Cash", "Cost of Goods", "Attendance", "Business KPI", "Memberships", "Current Stock", "Employee Sales"]
+        reports = ["Employee Sales"]
         failed_reports = []
         succeeded_reports = []
 
