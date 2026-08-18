@@ -87,6 +87,16 @@ REPORT_FOLDERS = {
 }
 SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 
+# Reverse lookup for log lines: a folder id says nothing in a log, the report
+# name says which folder was written to.
+FOLDER_NAMES = {folder_id: name for name, folder_id in REPORT_FOLDERS.items()}
+FOLDER_NAMES[DONE_FOLDER_ID] = "Done"
+FOLDER_NAMES.setdefault(DRIVE_FOLDER_ID, "Reports")
+
+
+def folder_label(folder_id):
+    return FOLDER_NAMES.get(folder_id, folder_id)
+
 GSHEET_ID = "1ebRZa2y25O5wuPTdbIOeAqokc3FEawToSBVx5yUthfQ"
 GSHEET_TABS = {
     "FBAds": {"gid": 1784599697, "folder_id": "1rs8hu18v64Xml3ZQ4F1Mr5uytZ6V5ppC"},
@@ -150,11 +160,11 @@ def upload_to_drive(filepath, folder_id=DRIVE_FOLDER_ID):
     uploaded = service.files().create(
         body=file_metadata,
         media_body=media,
-        fields="id,webViewLink",
+        fields="id",
     ).execute()
     time.sleep(3)
 
-    print(f"Uploaded to Drive: {filename} ({uploaded.get('webViewLink')})")
+    print(f"Uploaded to {folder_label(folder_id)} folder: {filename}")
 
     if not uploaded or not uploaded.get('id'):
         raise Exception(f"Upload failed: {filename}")
