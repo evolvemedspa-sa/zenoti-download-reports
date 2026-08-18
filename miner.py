@@ -81,6 +81,7 @@ REPORT_FOLDERS = {
     "Stock Ledger": "1JwZGmMBu-3ZHb67edqOZ8vsj5u9eMRd9",
     "FBAds": "1rs8hu18v64Xml3ZQ4F1Mr5uytZ6V5ppC",
     "GoogleAds": "15Cxii7nKW4XXhJNPjAUd2Y819GxneYNa",
+    "Orders": "1snJsOiH3EtI_c4rdti1VHtP5oez0n1U-",
 }
 SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 
@@ -218,10 +219,16 @@ def move_existing_reports_to_done():
         if not service:
             return
 
-        existing = list_all_files(service, folder_id)
+        # A bad/unreachable folder id raises 404 here. This sweep runs pre-login,
+        # so letting it propagate kills the whole run before a single report is
+        # downloaded - degrade to a warning and keep the other folders going.
+        try:
+            existing = list_all_files(service, folder_id)
+        except Exception as e:
+            print(f"  Could not list {folder_name} ({folder_id}): {e}")
+            continue
         if not existing:
             continue
-
         print(f"{folder_name}: {len(existing)} existing file(s) to move")
         moved = 0
         for old_file in existing:
@@ -545,8 +552,12 @@ def do_login(page):
 
 
 def wait_for_dashboard(page):
+    # Login lands on either shell depending on the session: the Reports
+    # dashboard (#menuLinkreports) or the admin rail (div.menuNavBtn). Accept
+    # any nav element - every caller only needs "the shell is up", and
+    # download_report() navigates to the page it wants itself.
     try:
-        page.locator('#menuLinkreports').wait_for(state='visible', timeout=60000)
+        page.locator('#menuLinkreports, div.menuNavBtn, #usernameBtn').first.wait_for(state='visible', timeout=60000)
         print("Dashboard loaded.")
     except Exception as e:
         print(f"Error: Dashboard menu not found. URL: {page.url}")
@@ -902,6 +913,8 @@ def validate_report_folders(succeeded_reports):
                 ]
             else:
                 expected = [f"current_stock_{END_DATE}.csv"]
+        elif report == "Orders":
+            expected = [f"orders_{END_DATE}.csv"]
         else:
             safe_name = report.replace(" ", "_").lower()
             expected = [f"{safe_name}_{START_DATE}_to_{END_DATE}.csv"]
@@ -930,6 +943,509 @@ def validate_report_folders(succeeded_reports):
     return missing
 
 
+# --- Inventory > Orders (PODetailsV2) ----------------------------------------
+# Orders is the one report that does not live on ReportsDashboard.aspx: it is an
+# ASP.NET listing page with an ag-Grid, entered by clicking the Inventory nav
+# (menuNavigationClick). A direct goto to
+# https://evolvemedspa.zenoti.com/ListingPages/PODetailsV2.aspx does not work.
+# Its filters are a zfc dropdown + two jQuery UI datepickers and its export is a
+# __doPostBack link, so none of the report code above applies to it.
+
+# The RadMenu center picker must sit at org level, not on one center: a single
+# center scopes the grid - and the export - to that center only.
+EXPECTED_CENTER = "Evolve Med Spa"
+
+# Consecutive empty grid readings needed before calling a window "no data":
+# a mid-refresh grid also renders zero rows for a moment.
+GRID_EMPTY_CONFIRMATIONS = 3
+
+# Returned by download_orders() instead of a filename when the window genuinely
+# holds no orders. Exporting an empty grid yields a headers-only file, which
+# validates and looks current while reporting zero orders downstream.
+ORDERS_NO_DATA = object()
+
+INVENTORY_NAV_SELS = (
+    "div.menuNavBtn[menu-item-key='inventory']",
+    "div.menuNavBtn[menu-module='inventory']",
+    "div.menuNavBtn[menu-url*='InventoryHome.aspx']",
+)
+ORDERS_LINK_SELS = (
+    "#leftAdminFlyPanel a[href='/ListingPages/PODetailsV2.aspx']",
+    "#leftAdminFlyPanel a[href*='PODetailsV2.aspx']",
+    "div.menuDashCls a[href*='PODetailsV2.aspx']",
+    "a[href*='PODetailsV2.aspx']",
+)
+
+
+def _mdy(date_str):
+    """YYYY-MM-DD -> M/d/yyyy, the Orders datepicker placeholder (unpadded)."""
+    d = datetime.strptime(date_str, "%Y-%m-%d").date()
+    return f"{d.month}/{d.day}/{d.year}"
+
+
+def find_in_frames(page, selectors, timeout=30000):
+    """Return (frame, selector) for the first visible match in any frame."""
+    deadline = time.time() + timeout / 1000.0
+    while True:
+        for frame in page.frames:
+            for sel in selectors:
+                try:
+                    if frame.locator(sel).first.is_visible(timeout=500):
+                        return frame, sel
+                except Exception:
+                    continue
+        if time.time() >= deadline:
+            return None, None
+        time.sleep(1)
+
+
+def settle(page, timeout=120000):
+    try:
+        page.wait_for_load_state("load", timeout=timeout)
+    except Exception as e:
+        print(f"  load state not reached: {e}")
+    try:
+        page.wait_for_load_state("networkidle", timeout=timeout)
+    except Exception as e:
+        print(f"  networkidle not reached: {e}")
+
+
+def _nav_to_orders_once(page):
+    """Inventory nav button -> fly-out panel -> Orders link."""
+    # Always reload the shell, even when already under /Admin/. Orders runs last,
+    # so the page is normally still ReportsDashboard.aspx with its #dialog-reports
+    # modal open - and that modal intercepts pointer events, so the Inventory nav
+    # click times out on an element Playwright reports as visible and enabled.
+    if page.url != ADMIN_URL:
+        print(f"  Loading a clean admin shell (was {page.url}).")
+        page.goto(ADMIN_URL, wait_until="domcontentloaded", timeout=120000)
+        settle(page)
+
+    frame, sel = find_in_frames(page, INVENTORY_NAV_SELS, timeout=60000)
+    if not frame:
+        raise Exception(f"Inventory nav button not found. URL: {page.url}")
+    frame.locator(sel).first.click(timeout=15000)
+    print(f"  Clicked Inventory nav ({sel}).")
+    time.sleep(2)
+    # The click may also navigate to InventoryHome.aspx; let that finish.
+    settle(page)
+
+    # The fly-out is informational here - the Orders link is what must be clickable.
+    panel_frame, _ = find_in_frames(page, ("#leftAdminFlyPanel",), timeout=15000)
+    print(f"  Inventory fly-out panel: {'visible' if panel_frame else 'not detected'}")
+
+    frame, sel = find_in_frames(page, ORDERS_LINK_SELS, timeout=60000)
+    if not frame:
+        raise Exception(f"Orders link not found after clicking Inventory. URL: {page.url}")
+    frame.locator(sel).first.click(timeout=15000)
+    print(f"  Clicked Orders link ({sel}).")
+    time.sleep(2)
+    settle(page)
+
+
+def open_orders_page(page, attempts=2):
+    """Reach the Orders listing through the Inventory nav panel."""
+    print("Opening Inventory > Orders...")
+    last_error = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            _nav_to_orders_once(page)
+        except Exception as e:
+            last_error = e
+            print(f"  Nav attempt {attempt}/{attempts} failed: {e}")
+
+        if "PODetailsV2" in page.url:
+            break
+
+        if page.url and "PODetailsV2" not in page.url:
+            print(f"  Still not on Orders after attempt {attempt}/{attempts}. URL: {page.url}")
+        if attempt < attempts:
+            time.sleep(5)
+
+    if "PODetailsV2" not in page.url:
+        raise Exception(
+            f"Could not reach the Orders page via the Inventory nav. URL: {page.url}"
+            + (f" Last error: {last_error}" if last_error else "")
+        )
+
+    # The date/export controls are rendered late; wait on them, not just the URL.
+    frame, _ = find_in_frames(page, ("#ddlTimePeriod",), timeout=120000)
+    if not frame:
+        raise Exception(f"Orders page loaded but #ddlTimePeriod never appeared. URL: {page.url}")
+    time.sleep(2)
+    print(f"Orders page fully loaded. URL: {page.url}")
+    return frame
+
+
+def _norm_center(text):
+    return "".join(ch for ch in (text or "").lower() if ch.isalnum())
+
+
+def ensure_center_scope(page):
+    """Guard the center picker: the RadMenu root must read the org name.
+
+    A single center selected in that menu silently scopes the grid - and the
+    export - to that one center, so a wrong scope must fail the run rather than
+    produce a whole-org filename holding one center's orders.
+    """
+    print(f"Checking center scope (expecting '{EXPECTED_CENTER}')...")
+    if "/Admin/" not in page.url:
+        print(f"  Not on the admin shell ({page.url}); loading it first.")
+        page.goto(ADMIN_URL, wait_until="domcontentloaded", timeout=120000)
+        settle(page)
+    root_sels = ("a.rmRootLink span.rmText", "a.rmRootLink", ".rmRootLink .rmText")
+    frame, sel = find_in_frames(page, root_sels, timeout=60000)
+    if not frame:
+        raise Exception("Center picker (a.rmRootLink) not found; cannot confirm the center scope")
+
+    current = (frame.locator(sel).first.text_content() or "").strip()
+    if _norm_center(current) == _norm_center(EXPECTED_CENTER):
+        print(f"  Center scope OK: '{current}'")
+        return
+
+    print(f"  Center scope is '{current}', not '{EXPECTED_CENTER}'. Trying to switch...")
+    # The item is <a class="rmLink" href="#"> with no onclick: the handler lives
+    # on the Telerik RadMenu client object. So el.click() hits nothing, and a
+    # real click cannot land either - this menu does not open on hover, so the
+    # item stays hidden. Drive the widget's own API, and fall back to a full
+    # bubbling mouse sequence if the client object is unreachable.
+    switch = frame.evaluate(
+        """(wanted) => {
+            const norm = s => (s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+            const target = norm(wanted);
+            const result = {menus: 0, found: false, method: null, error: null, options: []};
+
+            // get_items() returns a Telerik RadMenuItemCollection, not an array:
+            // it exposes get_count()/getItem(i) and is not iterable.
+            const toArray = coll => {
+                if (!coll) return [];
+                if (Array.isArray(coll)) return coll;
+                if (typeof coll.toArray === 'function') return coll.toArray();
+                if (typeof coll.get_count === 'function' && typeof coll.getItem === 'function') {
+                    const out = [];
+                    for (let i = 0; i < coll.get_count(); i++) out.push(coll.getItem(i));
+                    return out;
+                }
+                return [];
+            };
+
+            const walk = (coll, acc) => {
+                for (const it of toArray(coll)) {
+                    acc.push(it);
+                    if (typeof it.get_items === 'function') walk(it.get_items(), acc);
+                }
+                return acc;
+            };
+
+            if (typeof $find === 'function') {
+                const roots = Array.from(document.querySelectorAll('[id]'))
+                    .filter(el => String(el.className || '').indexOf('RadMenu') >= 0);
+                for (const el of roots) {
+                    let menu = null;
+                    try { menu = $find(el.id); } catch (e) {}
+                    if (!menu || typeof menu.get_items !== 'function') continue;
+                    result.menus++;
+                    for (const it of walk(menu.get_items(), [])) {
+                        const text = typeof it.get_text === 'function' ? it.get_text() : '';
+                        if (text) result.options.push(text.trim());
+                        if (norm(text) !== target) continue;
+                        result.found = true;
+                        try {
+                            const parent = typeof it.get_parent === 'function' ? it.get_parent() : null;
+                            if (parent && typeof parent.open === 'function') parent.open();
+                        } catch (e) {}
+                        try {
+                            it.click();
+                            result.method = 'RadMenuItem.click';
+                            return result;
+                        } catch (e) { result.error = String(e); }
+                    }
+                }
+            }
+
+            // Telerik's delegated handler wants the mouseover/mousedown/mouseup
+            // that precede a real click - el.click() alone sends none of them.
+            const hit = Array.from(document.querySelectorAll('.rmLink .rmText'))
+                .find(el => norm(el.textContent) === target);
+            if (!hit) return result;
+            result.found = true;
+            const link = hit.closest('a.rmLink') || hit;
+            for (const type of ['mouseover', 'mousedown', 'mouseup', 'click']) {
+                link.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true, view: window}));
+            }
+            result.method = 'mouse events';
+            return result;
+        }""",
+        EXPECTED_CENTER,
+    )
+
+    if not switch.get("found"):
+        raise Exception(
+            f"Center scope is '{current}', expected '{EXPECTED_CENTER}', and no menu item "
+            f"matches it. Refusing to export - the CSV would be scoped to the wrong "
+            f"center. Menu items seen: {switch.get('options')[:40]}"
+        )
+    print(f"  Center switch dispatched via {switch.get('method')} "
+          f"(RadMenu objects found: {switch.get('menus')})")
+
+    settle(page)
+    time.sleep(3)
+
+    frame, sel = find_in_frames(page, root_sels, timeout=60000)
+    if not frame:
+        raise Exception("Center picker disappeared after the switch; cannot confirm the center scope")
+    after = (frame.locator(sel).first.text_content() or "").strip()
+    if _norm_center(after) != _norm_center(EXPECTED_CENTER):
+        raise Exception(
+            f"Center switch did not take: picker still reads '{after}', expected "
+            f"'{EXPECTED_CENTER}'. Dispatched via {switch.get('method')}, "
+            f"RadMenu objects found: {switch.get('menus')}, error: {switch.get('error')}"
+        )
+    print(f"  Center scope now: '{after}'")
+
+
+def select_custom_time_period(page, frame):
+    print("Setting Time Period = Custom...")
+    frame.locator("#ddlTimePeriod").click()
+    time.sleep(1.5)
+
+    # The option list is a zfc dropdown rendered outside #ddlTimePeriod, so match
+    # on the visible label text instead of a container-scoped selector.
+    option = frame.locator(".divFilterListItm .zfcListItmLbl").filter(has_text="Custom")
+    clicked = False
+    try:
+        option.first.wait_for(state="visible", timeout=15000)
+        option.first.click(timeout=10000)
+        clicked = True
+    except Exception as e:
+        print(f"  Label click failed ({e}); dispatching click from JS...")
+        clicked = frame.evaluate("""() => {
+            const lbl = Array.from(document.querySelectorAll('.divFilterListItm .zfcListItmLbl'))
+                .find(el => el.textContent.trim() === 'Custom');
+            if (!lbl) return false;
+            const item = lbl.closest('.divFilterListItm') || lbl;
+            item.click();
+            return true;
+        }""")
+
+    if not clicked:
+        raise Exception("'Custom' option not found in the Time Period dropdown")
+
+    time.sleep(2)
+    # Close the dropdown so the From/To inputs are not covered.
+    page.keyboard.press("Escape")
+    page.mouse.click(5, 5)
+    time.sleep(1)
+
+    frame.wait_for_selector("#dateContainer", state="visible", timeout=30000)
+    print("  Time Period = Custom applied.")
+
+
+def set_date_input(frame, selector, value):
+    el = frame.locator(selector)
+    el.wait_for(state="visible", timeout=30000)
+    el.click()
+    el.fill("")
+    el.press_sequentially(value, delay=60)
+    time.sleep(0.5)
+    el.press("Escape")
+
+    # jQuery UI datepicker inputs only commit on change/blur; force both, and
+    # push the value through the datepicker API so its internal state matches.
+    frame.evaluate(
+        """([sel, val]) => {
+            const el = document.querySelector(sel);
+            if (!el) return null;
+            el.value = val;
+            if (window.jQuery) {
+                const $el = window.jQuery(el);
+                try { $el.datepicker('setDate', val); } catch (e) {}
+                $el.trigger('change');
+                $el.trigger('blur');
+            } else {
+                el.dispatchEvent(new Event('input', {bubbles: true}));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+                el.dispatchEvent(new Event('blur', {bubbles: true}));
+            }
+            return el.value;
+        }""",
+        [selector, value],
+    )
+    time.sleep(1.5)
+
+    actual = el.input_value()
+    if actual.strip() != value:
+        raise Exception(f"Date not applied on {selector}: asked {value}, field holds '{actual}'")
+    print(f"  {selector} = {actual}")
+
+
+def set_dates(frame, from_text, to_text):
+    print(f"Setting date range: {from_text} to {to_text}")
+    set_date_input(frame, "#MainContent_MainContent_PageContent_dpFromDate", from_text)
+    set_date_input(frame, "#MainContent_MainContent_PageContent_dpToDate", to_text)
+
+    # Some listing pages reload the grid only on an explicit refresh/apply.
+    frame.evaluate("""() => {
+        const btn = document.querySelector('#btnRefresh, #MainContent_MainContent_PageContent_btnRefresh, #btnApply');
+        if (btn) { btn.removeAttribute('disabled'); btn.click(); return true; }
+        return false;
+    }""")
+    time.sleep(2)
+
+
+def wait_for_grid(page, frame, timeout=300000):
+    """Rendered row count, 0 for a confirmed-empty grid, -1 if it never settled."""
+    print("Waiting for the table to load...")
+    settle(page, timeout=timeout)
+
+    deadline = time.time() + timeout / 1000.0
+    empty_streak = 0
+    last = None
+    while time.time() < deadline:
+        state = frame.evaluate("""() => {
+            const q = s => document.querySelector(s);
+
+            // offsetParent alone is not enough: ag-Grid hides overlays with the
+            // ag-hidden class and with visibility/opacity on ancestors.
+            const isVisible = el => {
+                if (!el) return false;
+                const r = el.getBoundingClientRect();
+                if (r.width === 0 && r.height === 0) return false;
+                for (let n = el; n; n = n.parentElement) {
+                    if (n.classList && n.classList.contains('ag-hidden')) return false;
+                    const st = getComputedStyle(n);
+                    if (st.display === 'none' || st.visibility === 'hidden') return false;
+                    if (parseFloat(st.opacity) === 0) return false;
+                }
+                return true;
+            };
+
+            const rows = document.querySelectorAll(
+                '.ag-center-cols-container .ag-row, .ag-body-viewport .ag-row, ' +
+                'table.gridTable tbody tr, #gridPOList .ag-row'
+            ).length;
+            const center = q('.ag-center-cols-container');
+
+            const loadingEl = q('.ag-overlay-loading-center, .ag-overlay-loading-wrapper');
+            // This build renders no-rows as .ag-overlay-no-rows-wrapper wrapping
+            // .ag-overlay-nodata ("No records to display"); older ones use
+            // .ag-overlay-no-rows-center. Accept any of them, plus the text.
+            const emptyEl = q(
+                '.ag-overlay-nodata, .ag-overlay-no-rows-wrapper, .ag-overlay-no-rows-center'
+            );
+            const emptyVisible = isVisible(emptyEl);
+            const overlayText = emptyVisible ? (emptyEl.textContent || '').trim().slice(0, 80) : '';
+
+            return {
+                rows,
+                // Grid shell present at all? Distinguishes "no data" from "not rendered yet".
+                mounted: !!q('.ag-body-viewport') && !!center,
+                // An empty result also collapses every row container to height: 1px.
+                centerHeight: center ? Math.round(center.getBoundingClientRect().height) : null,
+                loading: isVisible(loadingEl),
+                empty: emptyVisible,
+                overlayText,
+            };
+        }""")
+        last = state
+
+        if state["loading"]:
+            empty_streak = 0
+            time.sleep(2)
+            continue
+
+        if state["rows"] > 0:
+            print(f"  Table loaded: {state['rows']} rendered row(s).")
+            return state["rows"]
+
+        collapsed = state["centerHeight"] is not None and state["centerHeight"] <= 2
+        if state["mounted"] and (state["empty"] or collapsed):
+            # Require repeat readings: mid-refresh the grid also looks empty.
+            empty_streak += 1
+            if empty_streak >= GRID_EMPTY_CONFIRMATIONS:
+                reason = (
+                    f"overlay says '{state['overlayText']}'"
+                    if state["empty"]
+                    else f"row container collapsed to {state['centerHeight']}px"
+                )
+                print(f"  Table loaded with no rows ({reason}).")
+                return 0
+        else:
+            empty_streak = 0
+
+        time.sleep(2)
+
+    if last and last["mounted"] and last["rows"] == 0:
+        print(f"  Grid still empty at timeout (last: {last}); treating as no data.")
+        return 0
+
+    print(f"  WARNING: grid state never settled (last: {last}); exporting anyway.")
+    return -1
+
+
+def export_orders_csv(page, frame, end_date):
+    print("Exporting to CSV...")
+    frame.locator("#gridExportBtn").click()
+    time.sleep(1.5)
+    frame.wait_for_selector("#MainContent_MainContent_PageContent_btnExportcsv", state="attached", timeout=30000)
+
+    # The export link is a __doPostBack href; click it from JS so an overlay on
+    # the dropdown cannot swallow the event.
+    with page.expect_download(timeout=600000) as download_info:
+        frame.evaluate("""() => {
+            const a = document.querySelector('#MainContent_MainContent_PageContent_btnExportcsv');
+            if (a) { a.click(); return; }
+            if (typeof __doPostBack === 'function') {
+                __doPostBack('ctl00$ctl00$ctl00$MainContent$MainContent$PageContent$btnExportcsv', '');
+            }
+        }""")
+
+    download = download_info.value
+    script_dir = os.path.dirname(__file__) or "."
+    # Always .csv: the link clicked is btnExportcsv, and
+    # validate_report_folders() has to match one exact name.
+    filename = os.path.join(script_dir, f"orders_{end_date}.csv")
+    download.save_as(filename)
+    time.sleep(2)
+    print(f"  Saved as: {filename} (server suggested: {download.suggested_filename})")
+    return filename
+
+
+def download_orders(page, start_date, end_date):
+    # No center check here: main() enforces the scope once after login, before
+    # any report runs.
+    open_orders_page(page)
+    frame, _ = find_in_frames(page, ("#ddlTimePeriod",), timeout=120000)
+    if not frame:
+        raise Exception(f"#ddlTimePeriod missing on the Orders page. URL: {page.url}")
+    select_custom_time_period(page, frame)
+    set_dates(frame, _mdy(start_date), _mdy(end_date))
+    rows = wait_for_grid(page, frame)
+
+    if rows == 0:
+        # Nothing to export: the CSV button on an empty grid yields a
+        # headers-only (or error) file, which is worse than no file at all.
+        print(f"No orders for {_mdy(start_date)} to {_mdy(end_date)}. Skipping the export.")
+        return ORDERS_NO_DATA
+
+    filename = export_orders_csv(page, frame, end_date)
+
+    print(f"Validating downloaded file: {filename}")
+    validate_csv(filename)
+    print(f"Downloaded: {filename}")
+    return filename
+
+
+def report_window(report_name):
+    """(start, end) date strings for a report's date filter."""
+    if report_name == "Business KPI":
+        return BKP_START_DATE, END_DATE
+    if report_name in ("Current Stock", "Orders"):
+        return END_DATE, END_DATE          # single day: T-1
+    return START_DATE, END_DATE
+
+
 REPORT_FILTERS = {
     "Appointments": apply_appointments_filters,
     "Attendance": apply_attendance_filters,
@@ -945,6 +1461,11 @@ REPORT_FILTERS = {
 
 
 def download_report(context, page, report_name, start_date, end_date):
+    if report_name == "Orders":
+        # Not a ReportsDashboard report: own nav, own filters, own export link.
+        # Returns ORDERS_NO_DATA when the window holds no orders.
+        return download_orders(page, start_date, end_date)
+
     page.goto("https://evolvemedspa.zenoti.com/Admin/Reports/ReportsDashboard.aspx")
     page.wait_for_load_state("networkidle", timeout=120000)
     time.sleep(2)
@@ -1183,24 +1704,31 @@ with sync_playwright() as p:
         wait_for_dashboard(page)
         save_cookies(context)
 
-        reports = ["Stock Ledger", "Appointments", "Sales-Cash", "Cost of Goods", "Attendance", "Business KPI", "Memberships", "Current Stock", "Employee Sales"]
+        # Every report's export inherits the RadMenu center scope, so set it once
+        # up front rather than only before Orders. A single center selected there
+        # silently scopes every CSV to that center under a whole-org filename.
+        ensure_center_scope(page)
+        save_cookies(context)
+
+        reports = ["Stock Ledger", "Appointments", "Sales-Cash", "Cost of Goods", "Attendance", "Business KPI", "Memberships", "Current Stock", "Employee Sales", "Orders"]
         # reports = ["Employee Sales"]
         failed_reports = []
         succeeded_reports = []
 
         for report in reports:
             try:
+                report_start, report_end = report_window(report)
                 if report == "Business KPI":
-                    report_start = BKP_START_DATE
-                    report_end = END_DATE
                     print(f"Business KPI date filter: {report_start} to {report_end}")
-                elif report == "Current Stock":
-                    report_start = END_DATE
-                    report_end = END_DATE
-                else:
-                    report_start = START_DATE
-                    report_end = END_DATE
                 filename = download_report(context, page, report, report_start, report_end)
+                if filename is ORDERS_NO_DATA:
+                    # Not a failure and not a success: nothing was uploaded, so
+                    # keeping it out of succeeded_reports keeps
+                    # validate_report_folders() from hunting for a file that was
+                    # never meant to exist.
+                    print(f"{report}: no rows for {report_start}; nothing to upload.")
+                    save_cookies(context)
+                    continue
                 folder_id = REPORT_FOLDERS.get(report, DRIVE_FOLDER_ID)
                 upload_to_drive(filename, folder_id)
                 os.remove(filename)
@@ -1228,6 +1756,8 @@ with sync_playwright() as p:
                     do_login(page)
                     save_cookies(context)
                     wait_for_dashboard(page)
+                    # Fresh session, fresh center scope.
+                    ensure_center_scope(page)
             except Exception as e:
                 print(f"Re-login failed, skipping retries: {e}")
                 relogin_ok = False
@@ -1238,16 +1768,12 @@ with sync_playwright() as p:
             for report, prev_error in (failed_reports if relogin_ok else []):
                 try:
                     print(f"Retrying: {report}")
-                    if report == "Business KPI":
-                        report_start = BKP_START_DATE
-                        report_end = END_DATE
-                    elif report == "Current Stock":
-                        report_start = END_DATE
-                        report_end = END_DATE
-                    else:
-                        report_start = START_DATE
-                        report_end = END_DATE
+                    report_start, report_end = report_window(report)
                     filename = download_report(context, page, report, report_start, report_end)
+                    if filename is ORDERS_NO_DATA:
+                        print(f"{report}: no rows for {report_start}; nothing to upload.")
+                        save_cookies(context)
+                        continue
                     folder_id = REPORT_FOLDERS.get(report, DRIVE_FOLDER_ID)
                     upload_to_drive(filename, folder_id)
                     os.remove(filename)
@@ -1310,6 +1836,8 @@ with sync_playwright() as p:
                     do_login(page)
                     save_cookies(context)
                     wait_for_dashboard(page)
+                    # Fresh session, fresh center scope.
+                    ensure_center_scope(page)
             except Exception as e:
                 print(f"Re-login failed, abandoning re-download: {e}")
                 break
@@ -1318,16 +1846,12 @@ with sync_playwright() as p:
             for report in list(missing_reports):
                 try:
                     print(f"Re-downloading: {report}")
-                    if report == "Business KPI":
-                        report_start = BKP_START_DATE
-                        report_end = END_DATE
-                    elif report == "Current Stock":
-                        report_start = END_DATE
-                        report_end = END_DATE
-                    else:
-                        report_start = START_DATE
-                        report_end = END_DATE
+                    report_start, report_end = report_window(report)
                     filename = download_report(context, page, report, report_start, report_end)
+                    if filename is ORDERS_NO_DATA:
+                        print(f"{report}: no rows for {report_start}; nothing to upload.")
+                        save_cookies(context)
+                        continue
                     folder_id = REPORT_FOLDERS.get(report, DRIVE_FOLDER_ID)
                     upload_to_drive(filename, folder_id)
                     os.remove(filename)
