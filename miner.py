@@ -36,6 +36,8 @@ LOGIN_MAX_ATTEMPTS = 3
 LOGIN_RETRY_BACKOFF = 5
 REDOWNLOAD_MAX_ATTEMPTS = 2
 REDOWNLOAD_RETRY_BACKOFF = 10
+# Retry passes over reports that failed their first download.
+RETRY_MAX_ATTEMPTS = 2
 
 # Current Stock exports as CSV. Flip to True to download it as a workbook
 # (#export_excel_v2) instead; the Excel path and validate_excel() stay in place.
@@ -1467,76 +1469,39 @@ def download_report(context, page, report_name, start_date, end_date):
         return download_orders(page, start_date, end_date)
 
     page.goto("https://evolvemedspa.zenoti.com/Admin/Reports/ReportsDashboard.aspx")
-    page.wait_for_load_state("networkidle", timeout=120000)
+    settle(page, timeout=45000)
     time.sleep(2)
     print(f"Opening report: {report_name}")
 
-    if report_name == "Business KPI":
-        page.evaluate('loadBookmarksViewAllGrid("Bookmarked")')
-        time.sleep(2)
-        with context.expect_page(timeout=120000) as new_page_info:
-            page.evaluate("ReportsGrid_Row_Click(event,'business_kpi')")
-    elif report_name == "Memberships":
-        page.evaluate('loadBookmarksViewAllGrid("Bookmarked")')
-        time.sleep(2)
-        with context.expect_page(timeout=120000) as new_page_info:
-            page.evaluate("ReportsGrid_Row_Click(event,'memberships')")
-    elif report_name == "Stock Ledger":
-        page.evaluate('loadBookmarksViewAllGrid("Bookmarked")')
-        time.sleep(2)
-        with context.expect_page(timeout=120000) as new_page_info:
-            page.evaluate("ReportsGrid_Row_Click(event,'stock_ledger')")
-    elif report_name == "Current Stock":
-        page.evaluate('loadBookmarksViewAllGrid("Bookmarked")')
-        time.sleep(2)
-        with context.expect_page(timeout=120000) as new_page_info:
-            page.evaluate("ReportsGrid_Row_Click(event,'current_stock')")
-    elif report_name == "Employee Sales":
-        # Unlike the other bookmarked reports there is no
-        # ReportsGrid_Row_Click(event,'<id>') handle for this one, so find the
-        # row by its visible name. "View All" renders the grid inside the
-        # #dialog-reports modal and the same span may also exist in the grid
-        # *behind* it, so scope the lookup to the modal — and dispatch the click
-        # from JS, because a Playwright click is eaten by the modal overlay
-        # intercepting pointer events.
+    # Reports reachable from the bookmarks grid: Zenoti's own row onclick is
+    # ReportsGrid_Row_Click(event,'<id>'), so call it directly. Dispatching a
+    # click on the row instead goes through the #dialog-reports modal overlay,
+    # which is how Employee Sales ended up printing its onclick attribute and
+    # then never opening a tab.
+    BOOKMARKED_REPORT_IDS = {
+        "Business KPI": "business_kpi",
+        "Memberships": "memberships",
+        "Stock Ledger": "stock_ledger",
+        "Current Stock": "current_stock",
+        "Employee Sales": "employee_sales",
+    }
+
+    report_id = BOOKMARKED_REPORT_IDS.get(report_name)
+    if report_id:
         page.evaluate('loadBookmarksViewAllGrid("Bookmarked")')
         time.sleep(3)
-
-        find_row_js = """
-            (function() {
-                var modal = document.querySelector('#dialog-reports.show') ||
-                            document.querySelector('#dialog-reports');
-                var scope = modal || document;
-                return Array.from(scope.querySelectorAll('span.report-name'))
-                    .find(function(s) { return s.textContent.trim() === 'Employee Sales'; }) || null;
-            })()
-        """.strip()
-
-        # Fail fast on a missing row instead of burning the 120s expect_page timeout.
-        if not page.evaluate(f"!!{find_row_js}"):
-            raise Exception("'Employee Sales' not found in the View All report grid")
-
-        click_row_js = f"""
-            (function() {{
-                var span = {find_row_js};
-                var row = span.closest('tr') || span.closest('td') || span;
-                var handler = row.getAttribute('onclick') ||
-                              (row.parentElement && row.parentElement.getAttribute('onclick')) || '';
-                row.click();
-                return handler || '(no onclick attribute; dispatched click)';
-            }})();
-        """
-
         with context.expect_page(timeout=120000) as new_page_info:
-            print(f"  Row handler: {page.evaluate(click_row_js)}")
+            page.evaluate(f"ReportsGrid_Row_Click(event,'{report_id}')")
     else:
         with context.expect_page(timeout=120000) as new_page_info:
             page.locator('#gridReports span.report-name').get_by_text(report_name, exact=True).click(timeout=60000)
 
     time.sleep(2)
     report_page = new_page_info.value
-    report_page.wait_for_load_state("load", timeout=120000)
-    report_page.wait_for_load_state("networkidle", timeout=120000)
+    # Non-fatal: Zenoti report pages hold long-poll connections open, so
+    # networkidle can legitimately never arrive - on Railway's slower link that
+    # turned into a bare "Timeout 120000ms exceeded" that failed the report.
+    settle(report_page, timeout=45000)
     time.sleep(2)
     print(f"{report_name} report page loaded.")
 
@@ -1747,8 +1712,14 @@ with sync_playwright() as p:
                 page.bring_to_front()
                 time.sleep(2)
 
-        if failed_reports:
-            print(f"\n--- Retrying {len(failed_reports)} failed report(s) ---")
+        # Bounded retry passes. One pass was not enough: the failures seen so far
+        # are transient timeouts that a fresh nav clears.
+        for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
+            if not failed_reports:
+                break
+
+            print(f"\n--- Retrying {len(failed_reports)} failed report(s) "
+                  f"(attempt {attempt}/{RETRY_MAX_ATTEMPTS}) ---")
             relogin_ok = True
             try:
                 if needs_login(page):
@@ -1793,6 +1764,12 @@ with sync_playwright() as p:
                     time.sleep(2)
 
             failed_reports = retry_still_failed
+            if not relogin_ok:
+                break
+            if failed_reports and attempt < RETRY_MAX_ATTEMPTS:
+                print(f"Still failing {[r for r, _ in failed_reports]}; "
+                      f"next pass in {REDOWNLOAD_RETRY_BACKOFF}s...")
+                time.sleep(REDOWNLOAD_RETRY_BACKOFF)
 
         print(f"\n--- Report Summary ---")
         print(f"Succeeded: {succeeded_reports}")
