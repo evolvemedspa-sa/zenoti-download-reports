@@ -62,9 +62,15 @@ date_from = first_day_of_period - relativedelta(months=1)
 START_DATE = date_from.strftime("%Y-%m-%d")
 END_DATE = date_to.strftime("%Y-%m-%d")
 BKP_START_DATE = date_to.replace(day=1).strftime("%Y-%m-%d")
+# Orders window ends at date_to (T-1) and starts one calendar month before it,
+# anchored on date_to rather than today: Aug 19 -> Jul 18..Aug 18,
+# Aug 20 -> Jul 19..Aug 19. Both endpoints are inclusive, so the span is 31-32
+# days rather than a strict month - deliberate, chosen over Jul 19..Aug 18.
+ORDERS_START_DATE = (date_to - relativedelta(months=1)).strftime("%Y-%m-%d")
 
 print("Date From:", date_from.strftime("%m/%d/%Y"))
 print("Date To  :", date_to.strftime("%m/%d/%Y"))
+print("Orders   :", ORDERS_START_DATE, "to", END_DATE)
 
 IS_LOCAL = os.getenv("RAILWAY_ENVIRONMENT") is None
 
@@ -1453,8 +1459,10 @@ def report_window(report_name):
     """(start, end) date strings for a report's date filter."""
     if report_name == "Business KPI":
         return BKP_START_DATE, END_DATE
-    if report_name in ("Current Stock", "Orders"):
-        return END_DATE, END_DATE          # single day: T-1
+    if report_name == "Orders":
+        return ORDERS_START_DATE, END_DATE  # rolling calendar month ending T-1
+    if report_name == "Current Stock":
+        return END_DATE, END_DATE           # single day: T-1
     return START_DATE, END_DATE
 
 
