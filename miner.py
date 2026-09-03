@@ -921,9 +921,7 @@ def validate_report_folders(succeeded_reports):
             continue
 
         if report == "Business KPI":
-            # report_window() sends (BKP_START_DATE, END_DATE) and download_report()
-            # names the file from both endpoints, so the range form is what lands.
-            expected = [f"business_kpi_{BKP_START_DATE}_to_{END_DATE}.csv"]
+            expected = [f"business_kpi_{BKP_START_DATE}.csv"]
         elif report == "Current Stock":
             if CURRENT_STOCK_AS_EXCEL:
                 # Extension follows whatever the server served, so accept both.
@@ -1608,7 +1606,10 @@ def download_report(context, page, report_name, start_date, end_date):
     download = download_info.value
     script_dir = os.path.dirname(__file__) or "."
     if report_name == "Business KPI":
-        filename = os.path.join(script_dir, f"business_kpi_{start_date}_to_{end_date}.csv")
+        # Filename carries the month start (BKP_START_DATE) only - the KPI report
+        # covers month-to-date, so a start-only name is stable within the month
+        # and the Done sweep supersedes the previous day's copy.
+        filename = os.path.join(script_dir, f"business_kpi_{start_date}.csv")
     elif report_name == "Current Stock":
         if is_excel:
             # Trust the server's extension when it gives one (.xlsx vs .xls);
