@@ -921,7 +921,7 @@ def validate_report_folders(succeeded_reports):
             continue
 
         if report == "Business KPI":
-            expected = [f"business_kpi_{BKP_START_DATE}_to_{END_DATE}.csv"]
+            expected = [f"business_kpi_{BKP_START_DATE}.csv"]
         elif report == "Current Stock":
             if CURRENT_STOCK_AS_EXCEL:
                 # Extension follows whatever the server served, so accept both.
