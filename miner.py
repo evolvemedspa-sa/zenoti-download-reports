@@ -921,7 +921,9 @@ def validate_report_folders(succeeded_reports):
             continue
 
         if report == "Business KPI":
-            expected = [f"business_kpi_{BKP_START_DATE}.csv"]
+            # report_window() sends (BKP_START_DATE, END_DATE) and download_report()
+            # names the file from both endpoints, so the range form is what lands.
+            expected = [f"business_kpi_{BKP_START_DATE}_to_{END_DATE}.csv"]
         elif report == "Current Stock":
             if CURRENT_STOCK_AS_EXCEL:
                 # Extension follows whatever the server served, so accept both.
