@@ -4,7 +4,7 @@ import os
 if os.getenv("RAILWAY_ENVIRONMENT"):
     os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "/app/pw-browsers"
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
@@ -42,6 +42,7 @@ RETRY_MAX_ATTEMPTS = 2
 # Current Stock exports as CSV. Flip to True to download it as a workbook
 # (#export_excel_v2) instead; the Excel path and validate_excel() stay in place.
 CURRENT_STOCK_AS_EXCEL = False
+FEEDBACK_NO_DATA = object()
 
 if not USERNAME or not PASSWORD:
     raise ValueError("MINER_USER and MINER_PASSWORD must be set in the .env file.")
@@ -83,6 +84,7 @@ REPORT_FOLDERS = {
     "Appointments": "12jqbWWMgpgioR_23KJKLXSvDignwrcP2",
     "Sales-Accrual": "1TBdw_u-ADwb3m6GH-HY4WOVYblIPBxd-",
     "Employee Sales": "123hD_j54WtSPIAjdACWFEGaO877lztRs",
+    "Feedback": "1K1Q-OtrCDT023xYxwFQe2BWi8cSMvoZX",
     "Business KPI": "1GjkgXcKrGFqa8l9iM-rW8u2MeRVCaB_M",
     "Memberships": "172HJzXYy_9_qtlgTSlZUgUJmZmT-7qwH",
     "Current Stock": "174ZiUaKjIjEKJNKe75mZXKAwya0F4GNK",
@@ -695,6 +697,147 @@ def apply_sales_accrual_filters(report_page):
     print("  Sales-Accrual filters applied.")
 
 
+def wait_for_reports_catalog(page, report_id):
+    """Wait for the ReportsList instance, which loads after ReportDetails.js."""
+    print(f"Waiting for the reports catalog ({report_id})...")
+    try:
+        page.wait_for_function("""reportId => (
+            typeof loadBookmarksViewAllGrid === 'function' &&
+            typeof ReportsGrid_Row_Click === 'function' &&
+            typeof window.objReportsList?.getFavourites === 'function' &&
+            !!window.objReportsList?.reportByCode?.[reportId]?.url
+        )""", arg=report_id, timeout=120000)
+    except PlaywrightTimeoutError as error:
+        raise RuntimeError(
+            f"Zenoti did not finish loading the reports catalog or '{report_id}' is unavailable"
+        ) from error
+
+
+def wait_feedback_report_idle(report_page):
+    """Wait for Feedback filter refreshes without requiring networkidle."""
+    report_page.wait_for_load_state("domcontentloaded", timeout=30000)
+    try:
+        report_page.wait_for_load_state("networkidle", timeout=10000)
+    except PlaywrightTimeoutError:
+        pass
+    report_page.wait_for_function("""() => {
+        if (window.jQuery && window.jQuery.active) return false;
+        const visible = el => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+        return !Array.from(document.querySelectorAll(
+            '.blockUI.blockOverlay, .ag-overlay-loading-center, .ag-overlay-loading-wrapper'
+        )).some(visible);
+    }""", timeout=300000)
+
+
+def feedback_has_no_data(report_page):
+    """Confirm the visible empty-result overlay after the report refresh."""
+    for confirmation in range(3):
+        empty = report_page.evaluate("""() => {
+            const visible = el => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length) &&
+                getComputedStyle(el).visibility !== 'hidden';
+            if (window.jQuery?.active) return false;
+            if (Array.from(document.querySelectorAll(
+                '.ag-overlay-loading-center, .ag-overlay-loading-wrapper'
+            )).some(visible)) return false;
+            return Array.from(document.querySelectorAll('.ag-overlay-no-rows-wrapper')).some(overlay =>
+                visible(overlay) && Array.from(overlay.querySelectorAll('.ResponseMessageTitle')).some(title =>
+                    visible(title) && title.textContent.trim().toLowerCase() === 'data not found'
+                )
+            );
+        }""")
+        if not empty:
+            return False
+        if confirmation < 2:
+            report_page.wait_for_timeout(500)
+    return True
+
+
+def _feedback_select_all_filter(report_page, label, ids, values=()):
+    """Resolve only the requested filter; never select providers or services."""
+    result = report_page.evaluate("""config => {
+        const norm = text => (text || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+        let el = config.ids.map(id => document.getElementById(id)).find(Boolean);
+        if (!el) {
+            const wrapper = Array.from(document.querySelectorAll('.filterDiv')).find(w =>
+                norm(w.querySelector('.filterlabel')?.textContent) === norm(config.label)
+            );
+            el = wrapper?.querySelector('select[multiple]');
+        }
+        if (!el && config.values.length) {
+            el = Array.from(document.querySelectorAll('select[multiple]')).find(s =>
+                config.values.every(v => Array.from(s.options).some(o => o.value === v))
+            );
+        }
+        if (!el || el.tagName !== 'SELECT' || !el.multiple || !el.options.length) {
+            throw new Error('Missing or empty Feedback filter: ' + config.label);
+        }
+        const $el = jQuery(el);
+        $el.multiselect('selectAll', false);
+        $el.multiselect('updateButtonText');
+        $el.trigger('change');
+        const selected = Array.from(el.options).filter(o => o.selected).length;
+        if (selected !== el.options.length) throw new Error(config.label + ' did not select all options');
+        return {id: el.id, selected, total: el.options.length};
+    }""", {"label": label, "ids": ids, "values": list(values)})
+    wait_feedback_report_idle(report_page)
+    print(f"  {label}: All selected ({result['selected']})")
+    return result["id"]
+
+
+def _feedback_clear_zenoti_filter(report_page, filter_id, label):
+    report_page.evaluate("""config => {
+        const container = document.getElementById(config.id + '-zenoti-dropdown-container');
+        if (!container) throw new Error('Missing Feedback filter: ' + config.label);
+        const options = document.getElementById(config.id + '-zenoti-dropdown-options-container');
+        const all = document.getElementById(config.id + '-zenoti-dropdown-options-all');
+        if (all?.checked) all.click();
+        if (options) {
+            Array.from(options.querySelectorAll('input[type="checkbox"]:checked'))
+                .filter(cb => cb !== all).forEach(cb => { if (cb.checked) cb.click(); });
+        }
+        const select = document.getElementById(config.id);
+        if (select?.tagName === 'SELECT') {
+            Array.from(select.options).forEach(option => { option.selected = false; });
+        }
+    }""", {"id": filter_id, "label": label})
+    report_page.wait_for_function("""id => {
+        const text = document.getElementById(id + '-zenoti-dropdown-selection-text');
+        const select = document.getElementById(id);
+        const options = document.getElementById(id + '-zenoti-dropdown-options-container');
+        return !!text && /^(none selected)?$/i.test(text.textContent.trim()) &&
+            !(select?.tagName === 'SELECT' && Array.from(select.options).some(o => o.selected)) &&
+            !options?.querySelector('input[type="checkbox"]:checked');
+    }""", arg=filter_id, timeout=30000)
+    wait_feedback_report_idle(report_page)
+    print(f"  {label}: None Selected")
+
+
+def apply_feedback_filters(report_page):
+    print("Applying Feedback filters...")
+    selected_ids = [_feedback_select_all_filter(
+        report_page, "Centers", ["elm_allowed_centers", "elm_centers", "elm_center"]
+    )]
+    _feedback_clear_zenoti_filter(report_page, "elm_therapist", "Providers")
+    selected_ids.append(_feedback_select_all_filter(
+        report_page, "Appointment Status",
+        ["elm_appointment_status", "elm_appointments_status", "elm_status"],
+        ("Open", "Closed", "Cancelled", "NoShow", "CheckedIn", "Confirmed"),
+    ))
+    selected_ids.append(_feedback_select_all_filter(report_page, "Category", ["elm_category"]))
+    # Categories may reload the subcategory/service choices asynchronously.
+    selected_ids.append(_feedback_select_all_filter(report_page, "Sub Category", ["elm_sub_category"]))
+    _feedback_clear_zenoti_filter(report_page, "elm_service", "Service")
+    selected_ids.append(_feedback_select_all_filter(report_page, "Invoice Status", ["elm_invoice_status"]))
+    report_page.wait_for_function("""ids => ids.every(id => {
+        const el = document.getElementById(id);
+        return !!el?.options.length && Array.from(el.options).every(o => o.selected);
+    })""", arg=selected_ids, timeout=30000)
+    # Verify after all cascading changes, too.
+    _feedback_clear_zenoti_filter(report_page, "elm_therapist", "Providers")
+    _feedback_clear_zenoti_filter(report_page, "elm_service", "Service")
+    print("Feedback filters applied.")
+
+
 def apply_employee_sales_filters(report_page):
     print("  Applying Employee Sales filters...")
     # Targeted per-id selection, NOT a blanket $('select[multiple]') sweep:
@@ -909,13 +1052,16 @@ def download_gsheet_reports():
     return succeeded, failed
 
 
-def validate_report_folders(succeeded_reports):
+def validate_report_folders(succeeded_reports, no_data_reports=()):
     service = get_drive_service()
     if not service:
         return []
 
     missing = []
     for report in succeeded_reports:
+        if report in no_data_reports:
+            print(f"  SKIP {report}: confirmed no data; no file expected.")
+            continue
         folder_id = REPORT_FOLDERS.get(report)
         if not folder_id:
             continue
@@ -935,7 +1081,8 @@ def validate_report_folders(succeeded_reports):
             expected = [f"orders_{END_DATE}.csv"]
         else:
             safe_name = report.replace(" ", "_").lower()
-            expected = [f"{safe_name}_{START_DATE}_to_{END_DATE}.csv"]
+            report_start, report_end = report_window(report)
+            expected = [f"{safe_name}_{report_start}_to_{report_end}.csv"]
 
         results = service.files().list(
             q=f"'{folder_id}' in parents and trashed=false",
@@ -1461,7 +1608,7 @@ def report_window(report_name):
         return BKP_START_DATE, END_DATE
     if report_name == "Orders":
         return ORDERS_START_DATE, END_DATE  # rolling calendar month ending T-1
-    if report_name == "Current Stock":
+    if report_name in ("Current Stock", "Feedback"):
         return END_DATE, END_DATE           # single day: T-1
     return START_DATE, END_DATE
 
@@ -1472,6 +1619,7 @@ REPORT_FILTERS = {
     "Cost of Goods": apply_cost_of_goods_filters,
     "Sales-Accrual": apply_sales_accrual_filters,
     "Employee Sales": apply_employee_sales_filters,
+    "Feedback": apply_feedback_filters,
     "Sales-Cash": apply_sales_cash_filters,
     "Business KPI": apply_business_kpi_filters,
     "Memberships": apply_memberships_filters,
@@ -1502,14 +1650,16 @@ def download_report(context, page, report_name, start_date, end_date):
         "Stock Ledger": "stock_ledger",
         "Current Stock": "current_stock",
         "Employee Sales": "employee_sales",
+        "Feedback": "feedback",
     }
 
     report_id = BOOKMARKED_REPORT_IDS.get(report_name)
     if report_id:
+        wait_for_reports_catalog(page, report_id)
         page.evaluate('loadBookmarksViewAllGrid("Bookmarked")')
         time.sleep(3)
         with context.expect_page(timeout=120000) as new_page_info:
-            page.evaluate(f"ReportsGrid_Row_Click(event,'{report_id}')")
+            page.evaluate("reportId => ReportsGrid_Row_Click(null, reportId)", report_id)
     else:
         with context.expect_page(timeout=120000) as new_page_info:
             page.locator('#gridReports span.report-name').get_by_text(report_name, exact=True).click(timeout=60000)
@@ -1522,6 +1672,13 @@ def download_report(context, page, report_name, start_date, end_date):
     settle(report_page, timeout=45000)
     time.sleep(2)
     print(f"{report_name} report page loaded.")
+
+    if report_name == "Feedback":
+        report_page.bring_to_front()
+        report_page.locator("#elm_dates").wait_for(state="attached", timeout=60000)
+        report_page.wait_for_function("""() => !!(
+            window.jQuery && window.moment && jQuery('#elm_dates').data('daterangepicker')
+        )""", timeout=60000)
 
     if report_name == "Sales-Accrual":
         start_dt = f"{start_date} 00:00"
@@ -1552,13 +1709,18 @@ def download_report(context, page, report_name, start_date, end_date):
     time.sleep(2)
     print("Date range set.")
 
+    if report_name == "Feedback":
+        wait_feedback_report_idle(report_page)
+
     filter_fn = REPORT_FILTERS.get(report_name)
     if filter_fn:
         filter_fn(report_page)
     time.sleep(2)
 
     print("Refreshing report...")
-    if report_name == "Current Stock":
+    if report_name == "Feedback":
+        report_page.locator("#btnRefresh").click(timeout=60000)
+    elif report_name == "Current Stock":
         report_page.evaluate("""
             (function() {
                 if (typeof btnCurrentStock_onClick === 'function') {
@@ -1584,7 +1746,15 @@ def download_report(context, page, report_name, start_date, end_date):
     else:
         report_page.evaluate("document.querySelector('#btnRefresh').click()")
     time.sleep(2)
-    report_page.wait_for_load_state("networkidle", timeout=300000)
+    if report_name == "Feedback":
+        wait_feedback_report_idle(report_page)
+        if feedback_has_no_data(report_page):
+            print(f"Feedback: no data for {start_date} to {end_date}; skipping CSV export.")
+            report_page.close()
+            page.bring_to_front()
+            return FEEDBACK_NO_DATA
+    else:
+        report_page.wait_for_load_state("networkidle", timeout=300000)
     time.sleep(2)
 
     # The dropdown offers CSV (#export_csv), Excel (#export_excel_v2) and a hidden
@@ -1598,7 +1768,7 @@ def download_report(context, page, report_name, start_date, end_date):
     time.sleep(2)
     report_page.wait_for_selector(export_sel, state='attached', timeout=30000)
 
-    download_timeout = 900000 if report_name == "Stock Ledger" else 600000 if report_name == "Employee Sales" else 300000
+    download_timeout = 900000 if report_name == "Stock Ledger" else 600000 if report_name in ("Employee Sales", "Feedback") else 300000
     with report_page.expect_download(timeout=download_timeout) as download_info:
         report_page.evaluate(f"document.querySelector('{export_sel}').click()")
 
@@ -1696,10 +1866,11 @@ with sync_playwright() as p:
         ensure_center_scope(page)
         save_cookies(context)
 
-        reports = ["Stock Ledger", "Appointments", "Sales-Cash", "Cost of Goods", "Attendance", "Business KPI", "Memberships", "Current Stock", "Employee Sales", "Orders"]
-        # reports = ["Employee Sales"]
+        reports = ["Stock Ledger", "Appointments", "Sales-Cash", "Cost of Goods", "Attendance", "Business KPI", "Memberships", "Current Stock", "Employee Sales", "Feedback", "Orders"]
+        # reports = ["Feedback"]
         failed_reports = []
         succeeded_reports = []
+        no_data_reports = set()
 
         for report in reports:
             try:
@@ -1707,12 +1878,13 @@ with sync_playwright() as p:
                 if report == "Business KPI":
                     print(f"Business KPI date filter: {report_start} to {report_end}")
                 filename = download_report(context, page, report, report_start, report_end)
-                if filename is ORDERS_NO_DATA:
+                if filename is ORDERS_NO_DATA or filename is FEEDBACK_NO_DATA:
                     # Not a failure and not a success: nothing was uploaded, so
                     # keeping it out of succeeded_reports keeps
                     # validate_report_folders() from hunting for a file that was
                     # never meant to exist.
-                    print(f"{report}: no rows for {report_start}; nothing to upload.")
+                    no_data_reports.add(report)
+                    print(f"{report}: no data for {report_start} to {report_end}; nothing to upload.")
                     save_cookies(context)
                     continue
                 folder_id = REPORT_FOLDERS.get(report, DRIVE_FOLDER_ID)
@@ -1762,8 +1934,9 @@ with sync_playwright() as p:
                     print(f"Retrying: {report}")
                     report_start, report_end = report_window(report)
                     filename = download_report(context, page, report, report_start, report_end)
-                    if filename is ORDERS_NO_DATA:
-                        print(f"{report}: no rows for {report_start}; nothing to upload.")
+                    if filename is ORDERS_NO_DATA or filename is FEEDBACK_NO_DATA:
+                        no_data_reports.add(report)
+                        print(f"{report}: no data for {report_start} to {report_end}; nothing to upload.")
                         save_cookies(context)
                         continue
                     folder_id = REPORT_FOLDERS.get(report, DRIVE_FOLDER_ID)
@@ -1794,6 +1967,8 @@ with sync_playwright() as p:
 
         print(f"\n--- Report Summary ---")
         print(f"Succeeded: {succeeded_reports}")
+        if no_data_reports:
+            print(f"Skipped (no data): {sorted(no_data_reports)}")
         if failed_reports:
             print(f"Failed: {[r for r, _ in failed_reports]}")
 
@@ -1807,12 +1982,12 @@ with sync_playwright() as p:
         dedupe_report_folders()
 
         print("Validating report folders contain recent downloads...")
-        missing_reports = validate_report_folders(succeeded_reports)
+        missing_reports = validate_report_folders(succeeded_reports, no_data_reports)
 
         if missing_reports:
             print(f"\n--- Re-checking {len(missing_reports)} missing report(s) before re-download ---")
             time.sleep(10)
-            missing_reports = validate_report_folders(missing_reports)
+            missing_reports = validate_report_folders(missing_reports, no_data_reports)
 
         # Re-download anything Drive says is absent, then dedupe + re-validate and
         # try again. Bounded at REDOWNLOAD_MAX_ATTEMPTS: a report that fails twice
@@ -1846,8 +2021,9 @@ with sync_playwright() as p:
                     print(f"Re-downloading: {report}")
                     report_start, report_end = report_window(report)
                     filename = download_report(context, page, report, report_start, report_end)
-                    if filename is ORDERS_NO_DATA:
-                        print(f"{report}: no rows for {report_start}; nothing to upload.")
+                    if filename is ORDERS_NO_DATA or filename is FEEDBACK_NO_DATA:
+                        no_data_reports.add(report)
+                        print(f"{report}: no data for {report_start} to {report_end}; nothing to upload.")
                         save_cookies(context)
                         continue
                     folder_id = REPORT_FOLDERS.get(report, DRIVE_FOLDER_ID)
@@ -1874,7 +2050,7 @@ with sync_playwright() as p:
             # succeeded list, so the next pass retries only what is still absent.
             print(f"Validating after re-download attempt {attempt}...")
             dedupe_report_folders()
-            missing_reports = validate_report_folders(missing_reports)
+            missing_reports = validate_report_folders(missing_reports, no_data_reports)
 
             if missing_reports and attempt < REDOWNLOAD_MAX_ATTEMPTS:
                 print(f"Still missing {missing_reports}; retrying in {REDOWNLOAD_RETRY_BACKOFF}s...")
@@ -1886,7 +2062,7 @@ with sync_playwright() as p:
         if attempted_redownload:
             print("Final validation...")
             dedupe_report_folders()
-            still_missing = validate_report_folders(succeeded_reports)
+            still_missing = validate_report_folders(succeeded_reports, no_data_reports)
         else:
             still_missing = missing_reports
 
