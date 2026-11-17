@@ -17,6 +17,7 @@ import sys
 import io
 import glob
 import csv
+import traceback
 import pandas as pd
 from datetime import date, datetime, timedelta
 from dateutil.relativedelta import relativedelta
@@ -43,9 +44,6 @@ RETRY_MAX_ATTEMPTS = 2
 # (#export_excel_v2) instead; the Excel path and validate_excel() stay in place.
 CURRENT_STOCK_AS_EXCEL = False
 FEEDBACK_NO_DATA = object()
-
-if not USERNAME or not PASSWORD:
-    raise ValueError("MINER_USER and MINER_PASSWORD must be set in the .env file.")
 
 # yesterday = (date.today() - timedelta(days=1)).strftime("%Y-%m-%d")
 # START_DATE = yesterday
@@ -835,6 +833,14 @@ def apply_feedback_filters(report_page):
     # Verify after all cascading changes, too.
     _feedback_clear_zenoti_filter(report_page, "elm_therapist", "Providers")
     _feedback_clear_zenoti_filter(report_page, "elm_service", "Service")
+    # Checkbox clicks can leave Zenoti option panels open over Refresh and Export.
+    # Dismiss them after selection is verified, without changing filter values.
+    report_page.evaluate("""() => {
+        document.body.click();
+        document.querySelectorAll('.filterDiv .dropdown-options-container').forEach(options => {
+            options.style.display = 'none';
+        });
+    }""")
     print("Feedback filters applied.")
 
 
@@ -1811,13 +1817,6 @@ def download_report(context, page, report_name, start_date, end_date):
     return filename
 
 
-print("Script starting...")
-sys.stdout.flush()
-
-LOG_FILENAME = os.path.join(os.path.dirname(__file__) or ".", f"download_report_logs_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}.txt")
-log_file = open(LOG_FILENAME, "w", encoding="utf-8")
-
-
 class Tee:
     def __init__(self, *streams):
         self.streams = streams
@@ -1832,109 +1831,60 @@ class Tee:
             s.flush()
 
 
-sys.stdout = Tee(sys.__stdout__, log_file)
+def run_reports():
+    if not USERNAME or not PASSWORD:
+        raise ValueError("MINER_USER and MINER_PASSWORD must be set in the .env file.")
 
-cleanup_old_csvs()
+    cleanup_old_csvs()
 
-# Phase 1: scan every report folder upfront and move any existing file
-# (1 or more) to Done before downloading anything. Runs before the browser
-# launches so leftovers from a previous run are cleared even if login fails,
-# and so a bad GOOGLE_TOKEN_JSON surfaces before a full login.
-print("Moving existing report files to Done...")
-move_existing_reports_to_done()
+    # Phase 1: scan every report folder upfront and move any existing file
+    # (1 or more) to Done before downloading anything. Runs before the browser
+    # launches so leftovers from a previous run are cleared even if login fails,
+    # and so a bad GOOGLE_TOKEN_JSON surfaces before a full login.
+    print("Moving existing report files to Done...")
+    move_existing_reports_to_done()
 
-with sync_playwright() as p:
-    print("Playwright started.")
-    browser, context = create_browser_and_context(p)
-    print("Browser launched.")
-    page = context.new_page()
+    with sync_playwright() as p:
+        print("Playwright started.")
+        browser = context = None
+        try:
+            browser, context = create_browser_and_context(p)
+            print("Browser launched.")
+            page = context.new_page()
 
-    try:
-        if needs_login(page):
-            print("No valid session. Logging in...")
-            do_login(page)
-            save_cookies(context)
-        else:
-            print("Session valid from saved cookies. Skipping login.")
-
-        wait_for_dashboard(page)
-        save_cookies(context)
-
-        # Every report's export inherits the RadMenu center scope, so set it once
-        # up front rather than only before Orders. A single center selected there
-        # silently scopes every CSV to that center under a whole-org filename.
-        ensure_center_scope(page)
-        save_cookies(context)
-
-        reports = ["Stock Ledger", "Appointments", "Sales-Cash", "Cost of Goods", "Attendance", "Business KPI", "Memberships", "Current Stock", "Employee Sales", "Feedback", "Orders"]
-        # reports = ["Feedback"]
-        failed_reports = []
-        succeeded_reports = []
-        no_data_reports = set()
-
-        for report in reports:
-            try:
-                report_start, report_end = report_window(report)
-                if report == "Business KPI":
-                    print(f"Business KPI date filter: {report_start} to {report_end}")
-                filename = download_report(context, page, report, report_start, report_end)
-                if filename is ORDERS_NO_DATA or filename is FEEDBACK_NO_DATA:
-                    # Not a failure and not a success: nothing was uploaded, so
-                    # keeping it out of succeeded_reports keeps
-                    # validate_report_folders() from hunting for a file that was
-                    # never meant to exist.
-                    no_data_reports.add(report)
-                    print(f"{report}: no data for {report_start} to {report_end}; nothing to upload.")
-                    save_cookies(context)
-                    continue
-                folder_id = REPORT_FOLDERS.get(report, DRIVE_FOLDER_ID)
-                upload_to_drive(filename, folder_id)
-                os.remove(filename)
+            if needs_login(page):
+                print("No valid session. Logging in...")
+                do_login(page)
                 save_cookies(context)
-                succeeded_reports.append(report)
-                time.sleep(5)
-            except Exception as e:
-                print(f"FAILED: {report} — {e}")
-                failed_reports.append((report, str(e)))
-                for p in context.pages:
-                    if p != page:
-                        try:
-                            p.close()
-                        except Exception:
-                            pass
-                page.bring_to_front()
-                time.sleep(2)
+            else:
+                print("Session valid from saved cookies. Skipping login.")
 
-        # Bounded retry passes. One pass was not enough: the failures seen so far
-        # are transient timeouts that a fresh nav clears.
-        for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
-            if not failed_reports:
-                break
+            wait_for_dashboard(page)
+            save_cookies(context)
 
-            print(f"\n--- Retrying {len(failed_reports)} failed report(s) "
-                  f"(attempt {attempt}/{RETRY_MAX_ATTEMPTS}) ---")
-            relogin_ok = True
-            try:
-                if needs_login(page):
-                    print("Re-logging in before retry...")
-                    do_login(page)
-                    save_cookies(context)
-                    wait_for_dashboard(page)
-                    # Fresh session, fresh center scope.
-                    ensure_center_scope(page)
-            except Exception as e:
-                print(f"Re-login failed, skipping retries: {e}")
-                relogin_ok = False
+            # Every report's export inherits the RadMenu center scope, so set it once
+            # up front rather than only before Orders. A single center selected there
+            # silently scopes every CSV to that center under a whole-org filename.
+            ensure_center_scope(page)
+            save_cookies(context)
 
-            retry_still_failed = []
-            if not relogin_ok:
-                retry_still_failed = list(failed_reports)
-            for report, prev_error in (failed_reports if relogin_ok else []):
+            reports = ["Stock Ledger", "Appointments", "Sales-Cash", "Cost of Goods", "Attendance", "Business KPI", "Memberships", "Current Stock", "Employee Sales", "Feedback", "Orders"]
+            # reports = ["Feedback"]
+            failed_reports = []
+            succeeded_reports = []
+            no_data_reports = set()
+
+            for report in reports:
                 try:
-                    print(f"Retrying: {report}")
                     report_start, report_end = report_window(report)
+                    if report == "Business KPI":
+                        print(f"Business KPI date filter: {report_start} to {report_end}")
                     filename = download_report(context, page, report, report_start, report_end)
                     if filename is ORDERS_NO_DATA or filename is FEEDBACK_NO_DATA:
+                        # Not a failure and not a success: nothing was uploaded, so
+                        # keeping it out of succeeded_reports keeps
+                        # validate_report_folders() from hunting for a file that was
+                        # never meant to exist.
                         no_data_reports.add(report)
                         print(f"{report}: no data for {report_start} to {report_end}; nothing to upload.")
                         save_cookies(context)
@@ -1946,8 +1896,8 @@ with sync_playwright() as p:
                     succeeded_reports.append(report)
                     time.sleep(5)
                 except Exception as e:
-                    print(f"RETRY FAILED: {report} — {e}")
-                    retry_still_failed.append((report, str(e)))
+                    print(f"FAILED: {report} — {e}")
+                    failed_reports.append((report, str(e)))
                     for p in context.pages:
                         if p != page:
                             try:
@@ -1957,141 +1907,234 @@ with sync_playwright() as p:
                     page.bring_to_front()
                     time.sleep(2)
 
-            failed_reports = retry_still_failed
-            if not relogin_ok:
-                break
-            if failed_reports and attempt < RETRY_MAX_ATTEMPTS:
-                print(f"Still failing {[r for r, _ in failed_reports]}; "
-                      f"next pass in {REDOWNLOAD_RETRY_BACKOFF}s...")
-                time.sleep(REDOWNLOAD_RETRY_BACKOFF)
+            # Bounded retry passes. One pass was not enough: the failures seen so far
+            # are transient timeouts that a fresh nav clears.
+            for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
+                if not failed_reports:
+                    break
 
-        print(f"\n--- Report Summary ---")
-        print(f"Succeeded: {succeeded_reports}")
-        if no_data_reports:
-            print(f"Skipped (no data): {sorted(no_data_reports)}")
-        if failed_reports:
-            print(f"Failed: {[r for r, _ in failed_reports]}")
-
-        print(f"\n--- Google Sheet Extraction ---")
-        gsheet_succeeded, gsheet_failed = download_gsheet_reports()
-        print(f"Google Sheets succeeded: {gsheet_succeeded}")
-        if gsheet_failed:
-            print(f"Google Sheets failed: {[r for r, _ in gsheet_failed]}")
-
-        print("Checking report folders for duplicate filenames...")
-        dedupe_report_folders()
-
-        print("Validating report folders contain recent downloads...")
-        missing_reports = validate_report_folders(succeeded_reports, no_data_reports)
-
-        if missing_reports:
-            print(f"\n--- Re-checking {len(missing_reports)} missing report(s) before re-download ---")
-            time.sleep(10)
-            missing_reports = validate_report_folders(missing_reports, no_data_reports)
-
-        # Re-download anything Drive says is absent, then dedupe + re-validate and
-        # try again. Bounded at REDOWNLOAD_MAX_ATTEMPTS: a report that fails twice
-        # is failing for a reason a third pass won't fix, and each pass costs a
-        # full download.
-        redownload_failed = []
-        attempted_redownload = bool(missing_reports)
-        for attempt in range(1, REDOWNLOAD_MAX_ATTEMPTS + 1):
-            if not missing_reports:
-                break
-
-            print(
-                f"\n--- Re-downloading {len(missing_reports)} missing report(s) "
-                f"(attempt {attempt}/{REDOWNLOAD_MAX_ATTEMPTS}) ---"
-            )
-            try:
-                if needs_login(page):
-                    print("Re-logging in before re-download...")
-                    do_login(page)
-                    save_cookies(context)
-                    wait_for_dashboard(page)
-                    # Fresh session, fresh center scope.
-                    ensure_center_scope(page)
-            except Exception as e:
-                print(f"Re-login failed, abandoning re-download: {e}")
-                break
-
-            redownload_failed = []
-            for report in list(missing_reports):
+                print(f"\n--- Retrying {len(failed_reports)} failed report(s) "
+                      f"(attempt {attempt}/{RETRY_MAX_ATTEMPTS}) ---")
+                relogin_ok = True
                 try:
-                    print(f"Re-downloading: {report}")
-                    report_start, report_end = report_window(report)
-                    filename = download_report(context, page, report, report_start, report_end)
-                    if filename is ORDERS_NO_DATA or filename is FEEDBACK_NO_DATA:
-                        no_data_reports.add(report)
-                        print(f"{report}: no data for {report_start} to {report_end}; nothing to upload.")
+                    if needs_login(page):
+                        print("Re-logging in before retry...")
+                        do_login(page)
                         save_cookies(context)
-                        continue
-                    folder_id = REPORT_FOLDERS.get(report, DRIVE_FOLDER_ID)
-                    upload_to_drive(filename, folder_id)
-                    os.remove(filename)
-                    save_cookies(context)
-                    time.sleep(2)
+                        wait_for_dashboard(page)
+                        # Fresh session, fresh center scope.
+                        ensure_center_scope(page)
                 except Exception as e:
-                    print(f"RE-DOWNLOAD FAILED: {report} — {e}")
-                    redownload_failed.append(report)
-                    for p in context.pages:
-                        if p != page:
-                            try:
-                                p.close()
-                            except Exception:
-                                pass
-                    page.bring_to_front()
-                    time.sleep(2)
+                    print(f"Re-login failed, skipping retries: {e}")
+                    relogin_ok = False
 
-            if redownload_failed:
-                print(f"Re-download failures: {redownload_failed}")
+                retry_still_failed = []
+                if not relogin_ok:
+                    retry_still_failed = list(failed_reports)
+                for report, prev_error in (failed_reports if relogin_ok else []):
+                    try:
+                        print(f"Retrying: {report}")
+                        report_start, report_end = report_window(report)
+                        filename = download_report(context, page, report, report_start, report_end)
+                        if filename is ORDERS_NO_DATA or filename is FEEDBACK_NO_DATA:
+                            no_data_reports.add(report)
+                            print(f"{report}: no data for {report_start} to {report_end}; nothing to upload.")
+                            save_cookies(context)
+                            continue
+                        folder_id = REPORT_FOLDERS.get(report, DRIVE_FOLDER_ID)
+                        upload_to_drive(filename, folder_id)
+                        os.remove(filename)
+                        save_cookies(context)
+                        succeeded_reports.append(report)
+                        time.sleep(5)
+                    except Exception as e:
+                        print(f"RETRY FAILED: {report} — {e}")
+                        retry_still_failed.append((report, str(e)))
+                        for p in context.pages:
+                            if p != page:
+                                try:
+                                    p.close()
+                                except Exception:
+                                    pass
+                        page.bring_to_front()
+                        time.sleep(2)
 
-            # Validate against the reports we just re-downloaded, not the full
-            # succeeded list, so the next pass retries only what is still absent.
-            print(f"Validating after re-download attempt {attempt}...")
+                failed_reports = retry_still_failed
+                if not relogin_ok:
+                    break
+                if failed_reports and attempt < RETRY_MAX_ATTEMPTS:
+                    print(f"Still failing {[r for r, _ in failed_reports]}; "
+                          f"next pass in {REDOWNLOAD_RETRY_BACKOFF}s...")
+                    time.sleep(REDOWNLOAD_RETRY_BACKOFF)
+
+            print(f"\n--- Report Summary ---")
+            print(f"Succeeded: {succeeded_reports}")
+            if no_data_reports:
+                print(f"Skipped (no data): {sorted(no_data_reports)}")
+            if failed_reports:
+                print(f"Failed: {[r for r, _ in failed_reports]}")
+
+            print(f"\n--- Google Sheet Extraction ---")
+            gsheet_succeeded, gsheet_failed = download_gsheet_reports()
+            print(f"Google Sheets succeeded: {gsheet_succeeded}")
+            if gsheet_failed:
+                print(f"Google Sheets failed: {[r for r, _ in gsheet_failed]}")
+
+            print("Checking report folders for duplicate filenames...")
             dedupe_report_folders()
-            missing_reports = validate_report_folders(missing_reports, no_data_reports)
 
-            if missing_reports and attempt < REDOWNLOAD_MAX_ATTEMPTS:
-                print(f"Still missing {missing_reports}; retrying in {REDOWNLOAD_RETRY_BACKOFF}s...")
-                time.sleep(REDOWNLOAD_RETRY_BACKOFF)
+            print("Validating report folders contain recent downloads...")
+            missing_reports = validate_report_folders(succeeded_reports, no_data_reports)
 
-        # Final sweep across every report that downloaded successfully, so one that
-        # vanished from Drive after its own pass is still caught. Skipped when the
-        # first validation was already clean — line above would just repeat it.
-        if attempted_redownload:
-            print("Final validation...")
-            dedupe_report_folders()
-            still_missing = validate_report_folders(succeeded_reports, no_data_reports)
-        else:
-            still_missing = missing_reports
+            if missing_reports:
+                print(f"\n--- Re-checking {len(missing_reports)} missing report(s) before re-download ---")
+                time.sleep(10)
+                missing_reports = validate_report_folders(missing_reports, no_data_reports)
 
-        if still_missing:
-            raise Exception(
-                f"Reports still missing after {REDOWNLOAD_MAX_ATTEMPTS} re-download attempt(s): {still_missing}"
-            )
+            # Re-download anything Drive says is absent, then dedupe + re-validate and
+            # try again. Bounded at REDOWNLOAD_MAX_ATTEMPTS: a report that fails twice
+            # is failing for a reason a third pass won't fix, and each pass costs a
+            # full download.
+            redownload_failed = []
+            attempted_redownload = bool(missing_reports)
+            for attempt in range(1, REDOWNLOAD_MAX_ATTEMPTS + 1):
+                if not missing_reports:
+                    break
 
-        print("Logging out...")
-        page.goto("https://evolvemedspa.zenoti.com/Admin/Reports/ReportsDashboard.aspx")
-        page.wait_for_load_state("networkidle", timeout=60000)
-        time.sleep(1)
-        page.locator('#usernameBtn').click
-        time.sleep(1)
-        page.locator('.userLogoutCls').click
-        time.sleep(2)
-        print("Logged out.")
+                print(
+                    f"\n--- Re-downloading {len(missing_reports)} missing report(s) "
+                    f"(attempt {attempt}/{REDOWNLOAD_MAX_ATTEMPTS}) ---"
+                )
+                try:
+                    if needs_login(page):
+                        print("Re-logging in before re-download...")
+                        do_login(page)
+                        save_cookies(context)
+                        wait_for_dashboard(page)
+                        # Fresh session, fresh center scope.
+                        ensure_center_scope(page)
+                except Exception as e:
+                    print(f"Re-login failed, abandoning re-download: {e}")
+                    break
 
-        if failed_reports:
-            raise Exception(f"Reports failed after retry: {[r for r, _ in failed_reports]}")
+                redownload_failed = []
+                for report in list(missing_reports):
+                    try:
+                        print(f"Re-downloading: {report}")
+                        report_start, report_end = report_window(report)
+                        filename = download_report(context, page, report, report_start, report_end)
+                        if filename is ORDERS_NO_DATA or filename is FEEDBACK_NO_DATA:
+                            no_data_reports.add(report)
+                            print(f"{report}: no data for {report_start} to {report_end}; nothing to upload.")
+                            save_cookies(context)
+                            continue
+                        folder_id = REPORT_FOLDERS.get(report, DRIVE_FOLDER_ID)
+                        upload_to_drive(filename, folder_id)
+                        os.remove(filename)
+                        save_cookies(context)
+                        time.sleep(2)
+                    except Exception as e:
+                        print(f"RE-DOWNLOAD FAILED: {report} — {e}")
+                        redownload_failed.append(report)
+                        for p in context.pages:
+                            if p != page:
+                                try:
+                                    p.close()
+                                except Exception:
+                                    pass
+                        page.bring_to_front()
+                        time.sleep(2)
 
-    except Exception as e:
-        print(f"Error: {e}")
-        raise
+                if redownload_failed:
+                    print(f"Re-download failures: {redownload_failed}")
+
+                # Validate against the reports we just re-downloaded, not the full
+                # succeeded list, so the next pass retries only what is still absent.
+                print(f"Validating after re-download attempt {attempt}...")
+                dedupe_report_folders()
+                missing_reports = validate_report_folders(missing_reports, no_data_reports)
+
+                if missing_reports and attempt < REDOWNLOAD_MAX_ATTEMPTS:
+                    print(f"Still missing {missing_reports}; retrying in {REDOWNLOAD_RETRY_BACKOFF}s...")
+                    time.sleep(REDOWNLOAD_RETRY_BACKOFF)
+
+            # Final sweep across every report that downloaded successfully, so one that
+            # vanished from Drive after its own pass is still caught. Skipped when the
+            # first validation was already clean — line above would just repeat it.
+            if attempted_redownload:
+                print("Final validation...")
+                dedupe_report_folders()
+                still_missing = validate_report_folders(succeeded_reports, no_data_reports)
+            else:
+                still_missing = missing_reports
+
+            if still_missing:
+                raise Exception(
+                    f"Reports still missing after {REDOWNLOAD_MAX_ATTEMPTS} re-download attempt(s): {still_missing}"
+                )
+
+            print("Logging out...")
+            page.goto("https://evolvemedspa.zenoti.com/Admin/Reports/ReportsDashboard.aspx")
+            page.wait_for_load_state("networkidle", timeout=60000)
+            time.sleep(1)
+            page.locator('#usernameBtn').click
+            time.sleep(1)
+            page.locator('.userLogoutCls').click
+            time.sleep(2)
+            print("Logged out.")
+
+            if failed_reports:
+                raise Exception(f"Reports failed after retry: {[r for r, _ in failed_reports]}")
+
+        finally:
+            for name, resource in (("context", context), ("browser", browser)):
+                if resource is not None:
+                    try:
+                        resource.close()
+                    except Exception as error:
+                        print(f"Could not close {name}: {error}")
+
+
+def upload_run_log(log_filename):
+    """Attempt log delivery without replacing a report failure or losing its log."""
+    try:
+        uploaded = upload_to_drive(log_filename, DRIVE_FOLDER_ID)
+    except Exception as error:
+        print(f"Log upload failed: {error}. Keeping local log: {log_filename}", file=sys.stderr)
+        return
+
+    if not uploaded or not uploaded.get("id"):
+        print(f"Log upload skipped. Keeping local log: {log_filename}", file=sys.stderr)
+        return
+
+    try:
+        os.remove(log_filename)
+    except OSError as error:
+        print(f"Log uploaded, but could not remove local log {log_filename}: {error}", file=sys.stderr)
+
+
+def main():
+    log_filename = os.path.join(
+        os.path.dirname(__file__) or ".",
+        f"download_report_logs_{datetime.now().strftime('%Y-%m-%d_%H%M%S')}.txt",
+    )
+    original_stdout, original_stderr = sys.stdout, sys.stderr
+    try:
+        with open(log_filename, "w", encoding="utf-8") as log_file:
+            sys.stdout = Tee(original_stdout, log_file)
+            sys.stderr = Tee(original_stderr, log_file)
+            try:
+                print("Script starting...")
+                run_reports()
+            except BaseException:
+                traceback.print_exc()
+                raise
+            finally:
+                sys.stdout, sys.stderr = original_stdout, original_stderr
     finally:
-        context.close()
-        browser.close()
+        # Close the log before uploading, on both success and failure.
+        upload_run_log(log_filename)
 
-    sys.stdout = sys.__stdout__
-    log_file.close()
-    upload_to_drive(LOG_FILENAME, DRIVE_FOLDER_ID)
-    os.remove(LOG_FILENAME)
+
+if __name__ == "__main__":
+    main()
